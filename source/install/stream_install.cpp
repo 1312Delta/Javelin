@@ -10,13 +10,17 @@
 #include <stdlib.h>
 #include <cstdio>
 
+extern "C" {
+#include "ipcext/es.h"
+}
+
 #define STREAM_DEBUG 1
 
 #pragma pack(push, 1)
 typedef struct {
     u32 magic;
     u32 num_files;
-    u64 string_table_size;
+    u32 string_table_size;
     u32 reserved;
 } Pfs0Header;
 
@@ -90,9 +94,29 @@ void streamInstallExit(StreamInstallContext* ctx) {
         ctx->write_buffer = NULL;
     }
 
+    if (ctx->pfs0.file_entries) {
+        free(ctx->pfs0.file_entries);
+        ctx->pfs0.file_entries = NULL;
+    }
+
+    if (ctx->pfs0.string_table) {
+        free(ctx->pfs0.string_table);
+        ctx->pfs0.string_table = NULL;
+    }
+
     if (ctx->cnmt_found) {
         cnmtFree(&ctx->cnmt_ctx);
         ctx->cnmt_found = false;
+    }
+
+    if (ctx->ticket_data) {
+        free(ctx->ticket_data);
+        ctx->ticket_data = NULL;
+    }
+
+    if (ctx->cert_data) {
+        free(ctx->cert_data);
+        ctx->cert_data = NULL;
     }
 
     memset(ctx, 0, sizeof(StreamInstallContext));
@@ -110,6 +134,32 @@ void streamInstallReset(StreamInstallContext* ctx) {
     ctx->cnmt_found = false;
     ctx->state = STREAM_STATE_IDLE;
     ctx->file_type = STREAM_TYPE_UNKNOWN;
+    ctx->stream_file_offset = 0;
+
+    // Free and reset PFS0 header caches
+    if (ctx->pfs0.file_entries) {
+        free(ctx->pfs0.file_entries);
+        ctx->pfs0.file_entries = NULL;
+    }
+    if (ctx->pfs0.string_table) {
+        free(ctx->pfs0.string_table);
+        ctx->pfs0.string_table = NULL;
+    }
+    ctx->pfs0.header_cached = false;
+    ctx->pfs0.header_parsed = false;
+
+    // Free and reset ticket/cert caches
+    if (ctx->ticket_data) {
+        free(ctx->ticket_data);
+        ctx->ticket_data = NULL;
+    }
+    if (ctx->cert_data) {
+        free(ctx->cert_data);
+        ctx->cert_data = NULL;
+    }
+    ctx->ticket_size = 0;
+    ctx->cert_size = 0;
+    ctx->ticket_imported = false;
 
     (void)ctx->nca_ctx;
 }
@@ -183,9 +233,17 @@ static u64 streamAvailable(const StreamInstallContext* ctx) {
 }
 
 static bool parsePfs0Header(StreamInstallContext* ctx) {
-    Pfs0Header header;
-    if (streamRead(ctx, &header, sizeof(header)) != sizeof(header)) {
+    // Check if we have enough data for the initial header
+    if (streamAvailable(ctx) < sizeof(Pfs0Header)) {
         return false;  // Not enough data yet
+    }
+
+    // Read the basic header first (without consuming it yet)
+    Pfs0Header header;
+    u64 saved_read_pos = ctx->read_pos;
+    if (streamRead(ctx, &header, sizeof(header)) != sizeof(header)) {
+        ctx->read_pos = saved_read_pos;
+        return false;
     }
 
     if (header.magic != 0x30534650) {
@@ -193,35 +251,80 @@ static bool parsePfs0Header(StreamInstallContext* ctx) {
         return false;
     }
 
+    // Calculate total header size including file entries and string table
+    u64 file_entries_size = header.num_files * sizeof(Pfs0FileEntry);
+    u64 total_header_size = sizeof(Pfs0Header) + file_entries_size + header.string_table_size;
+
+    // Check if we have the complete header
+    // We already consumed sizeof(Pfs0Header), so check for the rest
+    if (streamAvailable(ctx) < file_entries_size + header.string_table_size) {
+        // Reset and wait for more data
+        ctx->read_pos = saved_read_pos;
+        return false;
+    }
+
+    // Now we can cache everything
     ctx->pfs0.num_files = header.num_files;
     ctx->pfs0.string_table_size = header.string_table_size;
-    ctx->pfs0.data_offset = sizeof(Pfs0Header) + header.num_files * sizeof(Pfs0FileEntry) + header.string_table_size;
+    ctx->pfs0.data_offset = total_header_size;
+    ctx->pfs0.file_entries_size = file_entries_size;
+
+    // Allocate and read file entries
+    ctx->pfs0.file_entries = (u8*)malloc(file_entries_size);
+    if (!ctx->pfs0.file_entries) {
+        LOG_ERROR("Stream Install: Failed to allocate file entries cache");
+        return false;
+    }
+    if (streamRead(ctx, ctx->pfs0.file_entries, file_entries_size) != file_entries_size) {
+        free(ctx->pfs0.file_entries);
+        ctx->pfs0.file_entries = NULL;
+        return false;
+    }
+
+    // Allocate and read string table
+    ctx->pfs0.string_table_alloc = header.string_table_size;
+    ctx->pfs0.string_table = (char*)malloc(header.string_table_size);
+    if (!ctx->pfs0.string_table) {
+        LOG_ERROR("Stream Install: Failed to allocate string table cache");
+        free(ctx->pfs0.file_entries);
+        ctx->pfs0.file_entries = NULL;
+        return false;
+    }
+    if (streamRead(ctx, ctx->pfs0.string_table, header.string_table_size) != header.string_table_size) {
+        free(ctx->pfs0.string_table);
+        ctx->pfs0.string_table = NULL;
+        free(ctx->pfs0.file_entries);
+        ctx->pfs0.file_entries = NULL;
+        return false;
+    }
+
     ctx->pfs0.header_parsed = true;
+    ctx->pfs0.header_cached = true;
+    ctx->stream_file_offset = total_header_size;  // We're now at the data section
 
 #if STREAM_DEBUG
-    LOG_INFO("Stream Install: PFS0 header - %u files, data at offset 0x%lX",
+    LOG_INFO("Stream Install: PFS0 header cached - %u files, data at offset 0x%lX",
              header.num_files, ctx->pfs0.data_offset);
 #endif
 
     return true;
 }
 
+// Get a file entry from the cached PFS0 header
 static bool getPfs0FileEntry(StreamInstallContext* ctx, u32 index, Pfs0FileEntry* entry) {
-    if (!ctx || !entry || !ctx->pfs0.header_parsed) return false;
+    if (!ctx || !entry || !ctx->pfs0.header_cached) return false;
     if (index >= ctx->pfs0.num_files) return false;
+    if (!ctx->pfs0.file_entries) return false;
 
-    u64 entry_offset = sizeof(Pfs0Header) + index * sizeof(Pfs0FileEntry);
-    u64 current_offset = ctx->buffer_pos - ctx->read_pos;
-
-    if (entry_offset > current_offset) return false;
-
-    streamSkip(ctx, entry_offset);
-    if (streamRead(ctx, entry, sizeof(Pfs0FileEntry)) != sizeof(Pfs0FileEntry)) {
-        return false;
-    }
-
-    ctx->read_pos = sizeof(Pfs0Header);
+    memcpy(entry, ctx->pfs0.file_entries + index * sizeof(Pfs0FileEntry), sizeof(Pfs0FileEntry));
     return true;
+}
+
+// Get a filename from the cached string table
+static const char* getPfs0Filename(StreamInstallContext* ctx, u32 string_offset) {
+    if (!ctx || !ctx->pfs0.string_table) return NULL;
+    if (string_offset >= ctx->pfs0.string_table_alloc) return NULL;
+    return ctx->pfs0.string_table + string_offset;
 }
 
 static Result installCurrentNca(StreamInstallContext* ctx) {
@@ -244,6 +347,9 @@ static Result installCurrentNca(StreamInstallContext* ctx) {
 
         u64 read = streamRead(ctx, buffer, to_write);
         if (read == 0) break;
+
+        // Track our position in the file stream
+        ctx->stream_file_offset += read;
 
         rc = ncmContentStorageWritePlaceHolder(&ctx->nca_ctx->content_storage,
                                                &ctx->placeholder_id,
@@ -270,9 +376,15 @@ static Result installCurrentNca(StreamInstallContext* ctx) {
         ncmContentStorageDeletePlaceHolder(&ctx->nca_ctx->content_storage, &ctx->placeholder_id);
 
         if (R_FAILED(rc)) {
-            LOG_ERROR("Stream Install: Failed to register NCA: 0x%08X", rc);
-            ctx->state = STREAM_STATE_ERROR;
-            return rc;
+            // 0x00000805 = content already exists, treat as success
+            if (rc == 0x805) {
+                LOG_INFO("Stream Install: NCA already exists, continuing");
+                rc = 0;
+            } else {
+                LOG_ERROR("Stream Install: Failed to register NCA: 0x%08X", rc);
+                ctx->state = STREAM_STATE_ERROR;
+                return rc;
+            }
         }
 
         ctx->ncaInstalling = false;
@@ -286,139 +398,238 @@ static Result installCurrentNca(StreamInstallContext* ctx) {
     return rc;
 }
 
-static Result installCnmtNca(StreamInstallContext* ctx) {
-    if (ctx->file_type != STREAM_TYPE_NSP || !ctx->pfs0.header_parsed) {
+// Start installing the next file in sequence (processes files in stream order)
+static Result startNextFile(StreamInstallContext* ctx) {
+    if (ctx->file_type != STREAM_TYPE_NSP || !ctx->pfs0.header_cached) {
         return MAKERESULT(Module_Libnx, LibnxError_BadInput);
     }
 
-    for (u32 i = 0; i < ctx->pfs0.num_files; i++) {
-        Pfs0FileEntry entry;
-        if (!getPfs0FileEntry(ctx, i, &entry)) continue;
+    // If we haven't started yet, find the CNMT NCA location first (we need it for metadata)
+    if (ctx->current_nca_index == 0 && !ctx->cnmt_found) {
+        // Scan all files to find the CNMT NCA
+        for (u32 i = 0; i < ctx->pfs0.num_files; i++) {
+            Pfs0FileEntry entry;
+            if (!getPfs0FileEntry(ctx, i, &entry)) continue;
 
-        // Get filename
-        ctx->read_pos = sizeof(Pfs0Header) + ctx->pfs0.num_files * sizeof(Pfs0FileEntry) + entry.string_offset;
+            const char* filename = getPfs0Filename(ctx, entry.string_offset);
+            if (!filename) continue;
 
-        char filename[64];
-        u64 read = streamRead(ctx, filename, sizeof(filename) - 1);
-        filename[read] = '\0';
+#if STREAM_DEBUG
+            LOG_DEBUG("Stream Install: File %u: %s (offset=0x%lX, size=%lu)", i, filename, entry.offset, entry.size);
+#endif
 
-        size_t len = strlen(filename);
-        if (len > 9 && strcasecmp(filename + len - 9, ".cnmt.nca") == 0) {
-            LOG_INFO("Stream Install: Found CNMT NCA: %s", filename);
+            size_t len = strlen(filename);
+            if (len > 9 && strcasecmp(filename + len - 9, ".cnmt.nca") == 0) {
+                LOG_INFO("Stream Install: Found CNMT NCA: %s (index %u)", filename, i);
 
-            for (int j = 0; j < 16 && filename[j * 2] != '\0'; j++) {
-                char hex_byte[3] = {filename[j * 2], filename[j * 2 + 1], '\0'};
-                ctx->cnmt_id.c[j] = (u8)strtoul(hex_byte, NULL, 16);
-            }
-
-            ctx->cnmt_size = entry.size;
-            ctx->current_nca_index = i;
-            ctx->nca_size = entry.size;
-            ctx->nca_offset = 0;
-            ctx->nca_id = ctx->cnmt_id;
-
-            // Create placeholder
-            ncmContentStorageGeneratePlaceHolderId(&ctx->nca_ctx->content_storage, &ctx->placeholder_id);
-            ncmContentStorageDeletePlaceHolder(&ctx->nca_ctx->content_storage, &ctx->placeholder_id);
-
-            Result rc = ncmContentStorageCreatePlaceHolder(&ctx->nca_ctx->content_storage,
-                                                           &ctx->nca_id,
-                                                           &ctx->placeholder_id,
-                                                           ctx->cnmt_size);
-            if (R_FAILED(rc)) {
-                LOG_ERROR("Stream Install: Failed to create CNMT placeholder: 0x%08X", rc);
-                return rc;
-            }
-
-            ctx->ncaInstalling = true;
-            ctx->read_pos = ctx->pfs0.data_offset + entry.offset;
-            return 0;
-        }
-    }
-
-    return MAKERESULT(Module_Libnx, LibnxError_NotFound);
-}
-
-static Result startNextContentNca(StreamInstallContext* ctx) {
-    if (!ctx->cnmt_found) return MAKERESULT(Module_Libnx, LibnxError_BadInput);
-
-    for (u32 i = ctx->current_nca_index + 1; i < ctx->pfs0.num_files; i++) {
-        Pfs0FileEntry entry;
-        if (!getPfs0FileEntry(ctx, i, &entry)) {
-            return 0x189;
-        }
-
-        ctx->read_pos = sizeof(Pfs0Header) + ctx->pfs0.num_files * sizeof(Pfs0FileEntry) + entry.string_offset;
-
-        char filename[64];
-        streamRead(ctx, filename, sizeof(filename) - 1);
-        filename[strlen(filename)] = '\0';
-
-        bool found = false;
-        NcmContentId content_id = {0};
-
-        for (u32 j = 0; j < ctx->cnmt_ctx.content_count; j++) {
-            char nca_filename[64];
-            snprintf(nca_filename, sizeof(nca_filename),
-                    "%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x.nca",
-                    ctx->cnmt_ctx.content_records[j].content_id.c[0],
-                    ctx->cnmt_ctx.content_records[j].content_id.c[1],
-                    ctx->cnmt_ctx.content_records[j].content_id.c[2],
-                    ctx->cnmt_ctx.content_records[j].content_id.c[3],
-                    ctx->cnmt_ctx.content_records[j].content_id.c[4],
-                    ctx->cnmt_ctx.content_records[j].content_id.c[5],
-                    ctx->cnmt_ctx.content_records[j].content_id.c[6],
-                    ctx->cnmt_ctx.content_records[j].content_id.c[7],
-                    ctx->cnmt_ctx.content_records[j].content_id.c[8],
-                    ctx->cnmt_ctx.content_records[j].content_id.c[9],
-                    ctx->cnmt_ctx.content_records[j].content_id.c[10],
-                    ctx->cnmt_ctx.content_records[j].content_id.c[11],
-                    ctx->cnmt_ctx.content_records[j].content_id.c[12],
-                    ctx->cnmt_ctx.content_records[j].content_id.c[13],
-                    ctx->cnmt_ctx.content_records[j].content_id.c[14],
-                    ctx->cnmt_ctx.content_records[j].content_id.c[15]);
-
-            if (strcmp(filename, nca_filename) == 0) {
-                content_id = ctx->cnmt_ctx.content_records[j].content_id;
-                found = true;
+                // Parse content ID from filename
+                for (int j = 0; j < 16 && filename[j * 2] != '\0'; j++) {
+                    char hex_byte[3] = {filename[j * 2], filename[j * 2 + 1], '\0'};
+                    ctx->cnmt_id.c[j] = (u8)strtoul(hex_byte, NULL, 16);
+                }
+                ctx->cnmt_size = entry.size;
+                // Don't set cnmt_found yet - we'll set it after parsing
                 break;
             }
         }
+    }
 
-        if (found) {
+    // Process files in order starting from current position
+    for (u32 i = ctx->current_nca_index; i < ctx->pfs0.num_files; i++) {
+        Pfs0FileEntry entry;
+        if (!getPfs0FileEntry(ctx, i, &entry)) {
+            LOG_ERROR("Stream Install: Failed to get file entry %u", i);
+            ctx->current_nca_index = i + 1;
+            continue;
+        }
+
+        const char* filename = getPfs0Filename(ctx, entry.string_offset);
+        if (!filename) {
+            LOG_ERROR("Stream Install: Failed to get filename for entry %u", i);
+            ctx->current_nca_index = i + 1;
+            continue;
+        }
+
+        size_t len = strlen(filename);
+        u64 file_offset = ctx->pfs0.data_offset + entry.offset;
+
+        // Check file type
+        bool is_ticket = (len > 4 && strcasecmp(filename + len - 4, ".tik") == 0);
+        bool is_cert = (len > 5 && strcasecmp(filename + len - 5, ".cert") == 0);
+        bool is_nca = (len > 4 && strcasecmp(filename + len - 4, ".nca") == 0);
+        bool is_cnmt_nca = (len > 9 && strcasecmp(filename + len - 9, ".cnmt.nca") == 0);
+
+        // Skip to file position if needed
+        if (file_offset > ctx->stream_file_offset) {
+            u64 to_skip = file_offset - ctx->stream_file_offset;
+            u64 available = streamAvailable(ctx);
+            if (to_skip > available) {
+                // Not enough data yet, wait for more
+                return 0;
+            }
+            streamSkip(ctx, to_skip);
+            ctx->stream_file_offset += to_skip;
+        }
+
+        // Handle ticket file
+        if (is_ticket) {
+            if (streamAvailable(ctx) >= entry.size && !ctx->ticket_data) {
+                ctx->ticket_data = (u8*)malloc(entry.size);
+                if (ctx->ticket_data) {
+                    u64 read = streamRead(ctx, ctx->ticket_data, entry.size);
+                    if (read == entry.size) {
+                        ctx->ticket_size = (u32)entry.size;
+                        ctx->stream_file_offset += entry.size;
+                        LOG_INFO("Stream Install: Cached ticket: %s (%u bytes)", filename, ctx->ticket_size);
+                    } else {
+                        free(ctx->ticket_data);
+                        ctx->ticket_data = NULL;
+                    }
+                }
+            } else if (streamAvailable(ctx) < entry.size) {
+                return 0; // Need more data
+            }
+            ctx->current_nca_index = i + 1;
+            continue;
+        }
+
+        // Handle certificate file
+        if (is_cert) {
+            if (streamAvailable(ctx) >= entry.size && !ctx->cert_data) {
+                ctx->cert_data = (u8*)malloc(entry.size);
+                if (ctx->cert_data) {
+                    u64 read = streamRead(ctx, ctx->cert_data, entry.size);
+                    if (read == entry.size) {
+                        ctx->cert_size = (u32)entry.size;
+                        ctx->stream_file_offset += entry.size;
+                        LOG_INFO("Stream Install: Cached cert: %s (%u bytes)", filename, ctx->cert_size);
+                    } else {
+                        free(ctx->cert_data);
+                        ctx->cert_data = NULL;
+                    }
+                }
+            } else if (streamAvailable(ctx) < entry.size) {
+                return 0; // Need more data
+            }
+            ctx->current_nca_index = i + 1;
+            continue;
+        }
+
+        // Handle NCA files
+        if (is_nca) {
+            // Parse content ID from filename
+            NcmContentId nca_id = {0};
+            for (int j = 0; j < 16 && filename[j * 2] != '\0'; j++) {
+                char hex_byte[3] = {filename[j * 2], filename[j * 2 + 1], '\0'};
+                nca_id.c[j] = (u8)strtoul(hex_byte, NULL, 16);
+            }
+
             ctx->current_nca_index = i;
-            ctx->nca_id = content_id;
+            ctx->nca_id = nca_id;
             ctx->nca_size = entry.size;
             ctx->nca_offset = 0;
+
+            // Delete any existing content with the same ID (from previous failed installs)
+            ncmContentStorageDelete(&ctx->nca_ctx->content_storage, &nca_id);
 
             // Create placeholder
             ncmContentStorageGeneratePlaceHolderId(&ctx->nca_ctx->content_storage, &ctx->placeholder_id);
             ncmContentStorageDeletePlaceHolder(&ctx->nca_ctx->content_storage, &ctx->placeholder_id);
 
             Result rc = ncmContentStorageCreatePlaceHolder(&ctx->nca_ctx->content_storage,
-                                                           &ctx->nca_id,
+                                                           &nca_id,
                                                            &ctx->placeholder_id,
-                                                           ctx->nca_size);
+                                                           entry.size);
             if (R_FAILED(rc)) {
                 LOG_ERROR("Stream Install: Failed to create placeholder: 0x%08X", rc);
                 return rc;
             }
 
             ctx->ncaInstalling = true;
-            ctx->read_pos = ctx->pfs0.data_offset + entry.offset;
-            LOG_INFO("Stream Install: Installing NCA %u/%u: %s",
-                     ctx->current_nca_index, ctx->pfs0.num_files, filename);
+
+            if (is_cnmt_nca) {
+                LOG_INFO("Stream Install: Installing CNMT NCA: %s (size: %lu)", filename, entry.size);
+            } else {
+                LOG_INFO("Stream Install: Installing NCA %u/%u: %s (size: %lu)",
+                         i + 1, ctx->pfs0.num_files, filename, entry.size);
+            }
             return 0;
         }
+
+        // Skip unknown file types
+        LOG_DEBUG("Stream Install: Skipping unknown file: %s", filename);
+        if (streamAvailable(ctx) >= entry.size) {
+            streamSkip(ctx, entry.size);
+            ctx->stream_file_offset += entry.size;
+        } else {
+            return 0; // Need more data
+        }
+        ctx->current_nca_index = i + 1;
     }
 
+    // All files processed
     ctx->state = STREAM_STATE_COMPLETE;
     return 0;
 }
 
+
+// Import cached ticket/cert if available
+static Result importCachedTicket(StreamInstallContext* ctx) {
+    if (ctx->ticket_imported) {
+        return 0;  // Already imported
+    }
+
+    if (!ctx->ticket_data || ctx->ticket_size == 0) {
+        LOG_DEBUG("Stream Install: No ticket to import (standard/free title)");
+        ctx->ticket_imported = true;  // Mark as done even if no ticket
+        return 0;
+    }
+
+    // Initialize ES service if needed
+    Result rc = esInitialize();
+    if (R_FAILED(rc)) {
+        LOG_ERROR("Stream Install: Failed to initialize ES service: 0x%08X", rc);
+        return rc;
+    }
+
+    // Import the ticket with certificate
+    if (ctx->cert_data && ctx->cert_size > 0) {
+        rc = esImportTicket(ctx->ticket_data, ctx->ticket_size,
+                           ctx->cert_data, ctx->cert_size);
+    } else {
+        // Try importing without cert (some tickets are self-contained)
+        rc = esImportTicket(ctx->ticket_data, ctx->ticket_size, NULL, 0);
+    }
+
+    esExit();
+
+    if (R_FAILED(rc)) {
+        // Error 0x1A05 means ticket already exists, which is fine
+        if (rc == 0x1A05) {
+            LOG_INFO("Stream Install: Ticket already exists (0x1A05)");
+            ctx->ticket_imported = true;
+            return 0;
+        }
+        LOG_ERROR("Stream Install: Failed to import ticket: 0x%08X", rc);
+        return rc;
+    }
+
+    LOG_INFO("Stream Install: Ticket imported successfully");
+    ctx->ticket_imported = true;
+    return 0;
+}
+
 static Result readCnmtFromInstalledNca(StreamInstallContext* ctx) {
+    // Import ticket before trying to open the CNMT NCA
+    // This is required for encrypted content
+    Result rc = importCachedTicket(ctx);
+    if (R_FAILED(rc)) {
+        LOG_WARN("Stream Install: Ticket import failed, trying anyway: 0x%08X", rc);
+        // Continue anyway - might be a free title that doesn't need a ticket
+    }
+
     char cnmt_path[FS_MAX_PATH];
-    Result rc = ncmContentStorageGetPath(&ctx->nca_ctx->content_storage, cnmt_path,
+    rc = ncmContentStorageGetPath(&ctx->nca_ctx->content_storage, cnmt_path,
                                          sizeof(cnmt_path), &ctx->cnmt_id);
     if (R_FAILED(rc)) {
         LOG_ERROR("Stream Install: Failed to get CNMT path: 0x%08X", rc);
@@ -506,80 +717,116 @@ s64 streamInstallProcessData(StreamInstallContext* ctx, const void* data, u64 si
     u64 write_remaining = size;
     u64 data_offset = 0;
 
-    while (write_remaining > 0) {
-        u64 buffer_offset = ctx->buffer_pos % ctx->buffer_size;
-        u64 contiguous_space = ctx->buffer_size - buffer_offset;
+    // Loop until we've consumed all input data or can't make progress
+    while (write_remaining > 0 || streamAvailable(ctx) > 0) {
+        // First, try to write incoming data to the ring buffer
+        while (write_remaining > 0) {
+            u64 buffer_offset = ctx->buffer_pos % ctx->buffer_size;
+            u64 contiguous_space = ctx->buffer_size - buffer_offset;
 
-        u64 unread_data = ctx->buffer_pos - ctx->read_pos;
-        u64 free_space = ctx->buffer_size - unread_data;
+            u64 unread_data = ctx->buffer_pos - ctx->read_pos;
+            u64 free_space = ctx->buffer_size - unread_data;
 
-        if (free_space == 0) {
+            if (free_space == 0) {
+                break;  // Buffer full, need to process some data first
+            }
+
+            u64 to_write = contiguous_space;
+            if (to_write > free_space) to_write = free_space;
+            if (to_write > write_remaining) to_write = write_remaining;
+
+            memcpy(ctx->buffer + buffer_offset, (const u8*)data + data_offset, to_write);
+            ctx->buffer_pos += to_write;
+            ctx->total_received += to_write;
+            data_offset += to_write;
+            write_remaining -= to_write;
+        }
+
+        // Now process data from the buffer
+        Result rc = 0;
+        u64 available_before = streamAvailable(ctx);
+
+        switch (ctx->state) {
+            case STREAM_STATE_RECEIVING:
+                // Try to parse PFS0 header - it will return false if we need more data
+                if (!ctx->pfs0.header_cached) {
+                    if (!parsePfs0Header(ctx)) {
+                        if (ctx->pfs0.header_parsed && !ctx->pfs0.header_cached) {
+                            LOG_WARN("Stream Install: Header partially parsed, waiting for more data");
+                        }
+                        break;
+                    }
+                    ctx->state = STREAM_STATE_INSTALLING;
+
+                    rc = startNextFile(ctx);
+                    if (R_FAILED(rc)) {
+                        LOG_ERROR("Stream Install: Failed to start file processing: 0x%08X", rc);
+                        ctx->state = STREAM_STATE_ERROR;
+                        return -1;
+                    }
+                }
+                break;
+
+            case STREAM_STATE_PARSING:
+            case STREAM_STATE_INSTALLING:
+                if (ctx->ncaInstalling) {
+                    rc = installCurrentNca(ctx);
+                    if (R_FAILED(rc)) {
+                        ctx->state = STREAM_STATE_ERROR;
+                        return -1;
+                    }
+
+                    if (!ctx->ncaInstalling) {
+                        bool was_cnmt = (memcmp(&ctx->nca_id, &ctx->cnmt_id, sizeof(NcmContentId)) == 0);
+
+                        if (was_cnmt && !ctx->cnmt_found) {
+                            rc = readCnmtFromInstalledNca(ctx);
+                            if (R_SUCCEEDED(rc)) {
+                                LOG_INFO("Stream Install: CNMT loaded successfully");
+                            } else {
+                                LOG_ERROR("Stream Install: Failed to read CNMT: 0x%08X", rc);
+                                ctx->state = STREAM_STATE_ERROR;
+                                return -1;
+                            }
+                        }
+
+                        ctx->current_nca_index++;
+                        rc = startNextFile(ctx);
+                        if (R_FAILED(rc)) {
+                            ctx->state = STREAM_STATE_ERROR;
+                            return -1;
+                        }
+                    }
+                } else {
+                    rc = startNextFile(ctx);
+                    if (R_FAILED(rc)) {
+                        ctx->state = STREAM_STATE_ERROR;
+                        return -1;
+                    }
+                }
+                break;
+
+            case STREAM_STATE_COMPLETE:
+            case STREAM_STATE_ERROR:
+                // Return all data as processed
+                return size;
+
+            default:
+                break;
+        }
+
+        // If we didn't consume any data from the buffer, we can't make progress
+        u64 available_after = streamAvailable(ctx);
+        if (available_after >= available_before && write_remaining > 0) {
+            // Buffer is full and we couldn't drain it - this shouldn't happen
+            // but return what we've processed so far
             break;
         }
 
-        u64 to_write = contiguous_space;
-        if (to_write > free_space) to_write = free_space;
-        if (to_write > write_remaining) to_write = write_remaining;
-
-        memcpy(ctx->buffer + buffer_offset, (const u8*)data + data_offset, to_write);
-        ctx->buffer_pos += to_write;
-        ctx->total_received += to_write;
-        data_offset += to_write;
-        write_remaining -= to_write;
-    }
-
-    Result rc = 0;
-
-    switch (ctx->state) {
-        case STREAM_STATE_RECEIVING:
-            if (!ctx->pfs0.header_parsed && streamAvailable(ctx) >= sizeof(Pfs0Header)) {
-                if (!parsePfs0Header(ctx)) {
-                    LOG_WARN("Stream Install: Not PFS0, trying XCI");
-                    ctx->state = STREAM_STATE_ERROR;
-                    return -1;
-                }
-                ctx->state = STREAM_STATE_PARSING;
-
-                rc = installCnmtNca(ctx);
-                if (R_FAILED(rc)) {
-                    LOG_ERROR("Stream Install: Failed to start CNMT: 0x%08X", rc);
-                    ctx->state = STREAM_STATE_ERROR;
-                    return -1;
-                }
-            }
+        // If there's no more data to write and we're not making progress, exit
+        if (write_remaining == 0 && available_after == available_before) {
             break;
-
-        case STREAM_STATE_PARSING:
-        case STREAM_STATE_INSTALLING:
-            if (ctx->ncaInstalling) {
-                rc = installCurrentNca(ctx);
-                if (R_FAILED(rc)) {
-                    ctx->state = STREAM_STATE_ERROR;
-                    return -1;
-                }
-
-                if (!ctx->ncaInstalling && !ctx->cnmt_found) {
-                    rc = readCnmtFromInstalledNca(ctx);
-                    if (R_SUCCEEDED(rc)) {
-                        LOG_INFO("Stream Install: CNMT loaded, starting content NCAs");
-                        ctx->current_nca_index++;
-                        rc = startNextContentNca(ctx);
-                    } else {
-                        LOG_ERROR("Stream Install: Failed to read CNMT: 0x%08X", rc);
-                        ctx->state = STREAM_STATE_ERROR;
-                    }
-                } else if (!ctx->ncaInstalling && ctx->cnmt_found) {
-                    rc = startNextContentNca(ctx);
-                }
-            }
-            break;
-
-        case STREAM_STATE_COMPLETE:
-        case STREAM_STATE_ERROR:
-            break;
-
-        default:
-            break;
+        }
     }
 
     return data_offset;

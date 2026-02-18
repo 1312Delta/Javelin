@@ -50,6 +50,12 @@ typedef struct {
         u64 string_table_size;
         u64 data_offset;
         bool header_parsed;
+        // Cached file entries and string table for random access
+        u8* file_entries;       // Pfs0FileEntry array
+        u64 file_entries_size;
+        char* string_table;     // Null-terminated strings
+        u64 string_table_alloc;
+        bool header_cached;     // True when all header data is cached
     } pfs0;
 
     // Current NCA being installed
@@ -75,9 +81,19 @@ typedef struct {
     NcmContentId cnmt_id;
     u64 cnmt_size;
 
+    // Ticket/Certificate caching for encrypted content
+    u8* ticket_data;
+    u32 ticket_size;
+    u8* cert_data;
+    u32 cert_size;
+    bool ticket_imported;
+
     // Pre-allocated write buffer for NCA installation (avoids per-call malloc)
     u8* write_buffer;
     u64 write_buffer_size;
+
+    // Track stream position for sequential processing
+    u64 stream_file_offset;  // Current position in the overall file stream
 
 } StreamInstallContext;
 
