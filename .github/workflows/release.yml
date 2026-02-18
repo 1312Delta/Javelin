@@ -1,0 +1,38 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    container:
+      image: devkitpro/devkita64:latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install Switch toolchain
+        run: |
+          dkp-pacman -Syu --noconfirm
+          dkp-pacman -S --noconfirm switch-dev
+
+      - name: Build
+        run: |
+          export DEVKITPRO=/opt/devkitpro
+          make gen_translations
+          make -j$(nproc)
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: Javelin.nro
+          generate_release_notes: true

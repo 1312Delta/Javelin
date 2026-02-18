@@ -1,0 +1,9 @@
+[submodule "libs/EventBus"]
+	path = libs/EventBus
+	url = https://github.com/gelldur/EventBus.git
+[submodule "libs/imgui"]
+	path = libs/imgui
+	url = https://github.com/ocornut/imgui.git
+[submodule "libs/libnx-ext"]
+	path = libs/libnx-ext
+	url = https://github.com/XorTroll/libnx-ext.git

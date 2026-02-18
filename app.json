@@ -1,0 +1,35 @@
+{
+  "name": "Javelin",
+  "author": "1312Delta",
+  "version": "1.0.0",
+  "title_id": "0x0100000000000001",
+  "main_thread_stack_size": "0x400000",
+  "main_thread_priority": 44,
+  "default_cpu_id": 3,
+  "process_category": 0,
+  "is_retail": true,
+  "pool_partition": 0,
+  "is_64bit": true,
+  "address_space_type": 3,
+  "filesystem_access": {
+    "permissions": [
+      "sdmc",
+      "bis_user",
+      "gamecard"
+    ]
+  },
+  "service_access": [
+    "fsp-srv",
+    "ns:am",
+    "ns",
+    "acc:u0",
+    "hid",
+    "vi:u",
+    "usb:hs",
+    "bsd:u",
+    "es",
+    "ncm",
+    "ns:am2"
+  ],
+  "service_host": []
+}
