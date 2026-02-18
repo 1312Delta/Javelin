@@ -28,8 +28,9 @@ jobs:
 
       - name: Install Switch toolchain
         run: |
-          dkp-pacman -Syu --noconfirm
-          dkp-pacman -S --noconfirm switch-dev
+          apt update
+          dkp-pacman --noconfirm -U \
+          "https://wii.leseratte10.de/devkitPro/other-stuff/dkp-toolchain-vars-1.0.2-1-any.pkg.tar.xz"
 
       - name: Build
         run: |
