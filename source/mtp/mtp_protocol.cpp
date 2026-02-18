@@ -120,6 +120,101 @@ static u32 write_mtp_string(u8* buffer, const char* str) {
     return (ptr - buffer);
 }
 
+// Convert UTF-16LE to UTF-8
+// Returns number of bytes written to out (excluding null terminator)
+static size_t utf16le_to_utf8(const u8* utf16_data, size_t utf16_chars, char* out, size_t out_size) {
+    if (!utf16_data || !out || out_size == 0 || utf16_chars == 0) {
+        if (out && out_size > 0) out[0] = '\0';
+        return 0;
+    }
+
+    size_t out_pos = 0;
+    for (size_t i = 0; i < utf16_chars && out_pos < out_size - 1; i++) {
+        u16 c = utf16_data[i * 2] | ((u16)utf16_data[i * 2 + 1] << 8);
+
+        if (c == 0) break;  // Null terminator
+
+        // Handle surrogate pairs (for characters outside BMP)
+        if (c >= 0xD800 && c <= 0xDBFF && i + 1 < utf16_chars) {
+            u16 c2 = utf16_data[(i + 1) * 2] | ((u16)utf16_data[(i + 1) * 2 + 1] << 8);
+            if (c2 >= 0xDC00 && c2 <= 0xDFFF) {
+                // Valid surrogate pair
+                u32 codepoint = 0x10000 + ((c - 0xD800) << 10) + (c2 - 0xDC00);
+                i++;  // Skip the low surrogate
+
+                // Encode as 4-byte UTF-8
+                if (out_pos + 4 <= out_size - 1) {
+                    out[out_pos++] = (char)(0xF0 | ((codepoint >> 18) & 0x07));
+                    out[out_pos++] = (char)(0x80 | ((codepoint >> 12) & 0x3F));
+                    out[out_pos++] = (char)(0x80 | ((codepoint >> 6) & 0x3F));
+                    out[out_pos++] = (char)(0x80 | (codepoint & 0x3F));
+                } else {
+                    break;  // Not enough space
+                }
+                continue;
+            }
+        }
+
+        // BMP character
+        if (c < 0x80) {
+            out[out_pos++] = (char)c;
+        } else if (c < 0x800) {
+            if (out_pos + 2 <= out_size - 1) {
+                out[out_pos++] = (char)(0xC0 | ((c >> 6) & 0x1F));
+                out[out_pos++] = (char)(0x80 | (c & 0x3F));
+            } else {
+                break;
+            }
+        } else {
+            if (out_pos + 3 <= out_size - 1) {
+                out[out_pos++] = (char)(0xE0 | ((c >> 12) & 0x0F));
+                out[out_pos++] = (char)(0x80 | ((c >> 6) & 0x3F));
+                out[out_pos++] = (char)(0x80 | (c & 0x3F));
+            } else {
+                break;
+            }
+        }
+    }
+
+    out[out_pos] = '\0';
+    return out_pos;
+}
+
+// Sanitize filename for FAT32 compatibility
+// Replaces illegal characters with '_' and handles UTF-8 characters that may cause issues
+static void sanitize_filename_fat32(char* filename) {
+    if (!filename) return;
+
+    // FAT32 illegal characters: \ / : * ? " < > |
+    // Also handle control characters (0x00-0x1F)
+    for (char* p = filename; *p; p++) {
+        unsigned char c = (unsigned char)*p;
+        if (c < 0x20) {
+            *p = '_';  // Control characters
+        } else {
+            switch (*p) {
+                case '\\':
+                case '/':
+                case ':':
+                case '*':
+                case '?':
+                case '"':
+                case '<':
+                case '>':
+                case '|':
+                    *p = '_';
+                    break;
+            }
+        }
+    }
+
+    // Trim trailing spaces and dots (FAT32 doesn't allow them at the end)
+    size_t len = strlen(filename);
+    while (len > 0 && (filename[len - 1] == ' ' || filename[len - 1] == '.')) {
+        filename[--len] = '\0';
+    }
+}
+
 static u32 write_u32_array(u8* buffer, const u32* array, u32 count) {
     u8* ptr = buffer;
 
@@ -1065,10 +1160,12 @@ static void handle_send_object_info(MtpProtocolContext* ctx, u32 transaction_id,
     u8 str_len = str_ptr[0];
     if (str_len > 0 && str_len < 128) {
         str_ptr++;
-        for (u32 i = 0; i < (u32)(str_len - 1) && i < MTP_MAX_FILENAME - 1; i++) {
-            filename[i] = (char)str_ptr[i * 2];
-        }
+        // Convert UTF-16LE to UTF-8 (str_len includes null terminator, so actual chars = str_len - 1)
+        utf16le_to_utf8(str_ptr, str_len - 1, filename, sizeof(filename));
     }
+
+    // Sanitize filename for FAT32 compatibility
+    sanitize_filename_fat32(filename);
 
     if (filename[0] == '\0') {
         send_response(ctx, MTP_RESP_INVALID_PARAMETER, transaction_id, NULL, 0);
