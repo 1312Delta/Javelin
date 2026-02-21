@@ -28,7 +28,7 @@ ARCH	:=	-march=armv8-a+crc+crypto -mtune=cortex-a57 -mtp=soft -fPIE
 # Handle DEBUG flag (default: 0 for production releases)
 # Set DEBUG=1 to enable debug output and nxlink networking
 ifndef DEBUG
-DEBUG := 0
+
 endif
 
 

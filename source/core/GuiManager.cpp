@@ -3,6 +3,7 @@
 //
 #include "GuiManager.h"
 #include "i18n/Localization.h"
+#include "install/stream_install.h"
 #include "imgui.h"
 #include <algorithm>
 #include <cmath>
@@ -57,6 +58,15 @@ void GuiManager::initialize() {
             [this](InstallCompleteEvent& e) { onInstallComplete(e); }
         )
     );
+
+    eventSubscriptions.push_back(
+        EventBus::getInstance().subscribe<PersonalizedTicketEvent>(
+            [this](PersonalizedTicketEvent& e) { onPersonalizedTicket(e); }
+        )
+    );
+
+    // Initialize ticket prompt
+    ticketPrompt.active = false;
 }
 
 void GuiManager::updateNotifications(float deltaTime) {
@@ -111,6 +121,12 @@ void GuiManager::renderNotifications() {
 }
 
 void GuiManager::renderModals() {
+    // Ticket prompt has highest priority - block all other modals when active
+    if (ticketPrompt.active) {
+        renderPersonalizedTicketModal();
+        return;
+    }
+
     std::vector<std::string> transfersToRemove;
 
     for (auto& pair : activeTransfers) {
@@ -130,7 +146,7 @@ void GuiManager::renderModals() {
 }
 
 bool GuiManager::isModalActive() const {
-    return !activeTransfers.empty() || !activeInstalls.empty();
+    return ticketPrompt.active || !activeTransfers.empty() || !activeInstalls.empty();
 }
 
 void GuiManager::renderStatusBar() {
@@ -306,6 +322,7 @@ void GuiManager::onInstallProgress(const InstallProgressEvent& event) {
         it->second.currentFile = event.currentFile;
         it->second.bytesWritten = event.bytesWritten;
         it->second.totalBytes = event.totalBytes;
+        it->second.stage = event.stage;
     }
 }
 
@@ -317,6 +334,17 @@ void GuiManager::onInstallComplete(const InstallCompleteEvent& event) {
         it->second.errorMessage = event.errorMessage;
         it->second.progressPercent = event.success ? 100.0f : 0.0f;
     }
+}
+
+void GuiManager::onPersonalizedTicket(const PersonalizedTicketEvent& event) {
+    // Store ticket info and activate prompt
+    ticketPrompt.titleName = event.titleName;
+    ticketPrompt.filePath = event.filePath;
+    memcpy(ticketPrompt.rightsId, event.rightsId, sizeof(ticketPrompt.rightsId));
+    ticketPrompt.deviceId = event.deviceId;
+    ticketPrompt.accountId = event.accountId;
+    ticketPrompt.streamContext = event.streamContext;
+    ticketPrompt.active = true;
 }
 
 ImVec4 GuiManager::getNotificationColor(NotificationEvent::Type type) const {
@@ -450,15 +478,21 @@ void GuiManager::renderInstallModal(const InstallProgress& install) {
                          ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
                          ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_AlwaysAutoResize)) {
 
-            ImGui::Text("%s %s", TR("modal.title"), install.titleName.c_str());
+            char titleText[512];
+            snprintf(titleText, sizeof(titleText), "%s %s", TR("modal.title"), install.titleName.c_str());
+            ImGui::Text("%s", titleText);
             ImGui::Spacing();
 
             if (!install.currentFile.empty()) {
-                ImGui::Text("%s %s", TR("modal.installing_file"), install.currentFile.c_str());
+                char fileText[512];
+                snprintf(fileText, sizeof(fileText), TR("modal.installing_file"), install.currentFile.c_str());
+                ImGui::Text("%s", fileText);
             }
 
             if (!install.stage.empty()) {
-                ImGui::Text("%s %s", TR("modal.stage"), install.stage.c_str());
+                char stageText[256];
+                snprintf(stageText, sizeof(stageText), TR("modal.stage"), install.stage.c_str());
+                ImGui::Text("%s", stageText);
             }
 
             ImGui::Spacing();
@@ -486,6 +520,94 @@ void GuiManager::renderInstallModal(const InstallProgress& install) {
         }
         ImGui::End();
     }
+}
+
+void GuiManager::renderPersonalizedTicketModal() {
+    if (!ticketPrompt.active) return;
+
+    ImGui::SetNextWindowPos(ImVec2(640, 360), ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+    ImGui::SetNextWindowSize(ImVec2(700, 0), ImGuiCond_Appearing);
+
+    if (ImGui::Begin(TR("ticket.personalized_warning"), nullptr,
+                     ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
+                     ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_AlwaysAutoResize)) {
+
+        ImGui::PushTextWrapPos(ImGui::GetCursorPos().x + 680);
+
+        // Warning icon and title
+        ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.0f, 1.0f), TR("icon.warning"));
+        ImGui::SameLine();
+        ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.0f, 1.0f), TR("ticket.personalized_detected"));
+
+        ImGui::Spacing();
+        ImGui::Separator();
+        ImGui::Spacing();
+
+        // Explanation text
+        ImGui::TextWrapped(TR("ticket.personalized_explanation"));
+
+        ImGui::Spacing();
+
+        // Ticket details
+        ImGui::Text(TR("ticket.detail_device_id"));
+        ImGui::SameLine();
+        ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "0x%016lX", ticketPrompt.deviceId);
+
+        ImGui::Text(TR("ticket.detail_account_id"));
+        ImGui::SameLine();
+        ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "0x%08X", ticketPrompt.accountId);
+
+        // Rights ID
+        ImGui::Text(TR("ticket.detail_rights_id"));
+        ImGui::SameLine();
+        char rightsIdStr[33];
+        for (int i = 0; i < 16; i++) {
+            snprintf(rightsIdStr + i * 2, 3, "%02X", ticketPrompt.rightsId[i]);
+        }
+        ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "%s", rightsIdStr);
+
+        ImGui::Spacing();
+        ImGui::Separator();
+        ImGui::Spacing();
+
+        // Conversion explanation
+        ImGui::TextWrapped(TR("ticket.conversion_explanation"));
+
+        ImGui::Spacing();
+
+        ImGui::PopTextWrapPos();
+
+        // Buttons
+        ImGui::Spacing();
+        float buttonWidth = 300.0f;
+        float totalWidth = buttonWidth * 2 + 20.0f;
+        float startX = (ImGui::GetWindowWidth() - totalWidth) / 2.0f;
+
+        ImGui::SetCursorPosX(startX);
+
+        if (ImGui::Button(TR("ticket.convert_to_common"), ImVec2(buttonWidth, 50)) ||
+            ImGui::IsKeyPressed(ImGuiKey_GamepadFaceRight)) {
+            // User approved conversion - notify the install context
+            if (ticketPrompt.streamContext) {
+                streamInstallSetTicketConversionApproved((StreamInstallContext*)ticketPrompt.streamContext, true);
+            }
+            ticketPrompt.active = false;
+        }
+
+        ImGui::SameLine();
+
+        if (ImGui::Button(TR("ticket.cancel_install"), ImVec2(buttonWidth, 50)) ||
+            ImGui::IsKeyPressed(ImGuiKey_GamepadFaceDown)) {
+            // User rejected - cancel installation
+            if (ticketPrompt.streamContext) {
+                streamInstallSetTicketConversionApproved((StreamInstallContext*)ticketPrompt.streamContext, false);
+            }
+            ticketPrompt.active = false;
+        }
+
+        ImGui::Spacing();
+    }
+    ImGui::End();
 }
 
 }

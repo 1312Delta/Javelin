@@ -5,6 +5,7 @@
 
 #include <string>
 #include <cstdint>
+#include <cstring>
 #include "Event.h"
 
 namespace Javelin {
@@ -93,12 +94,14 @@ struct InstallProgressEvent : public Event {
     float progressPercent;
     uint64_t bytesWritten;
     uint64_t totalBytes;
+    std::string stage;
 
     InstallProgressEvent() = default;
     InstallProgressEvent(const std::string& title, const std::string& file,
-                         float percent, uint64_t written, uint64_t total)
+                         float percent, uint64_t written, uint64_t total,
+                         const std::string& installStage = "")
         : titleName(title), currentFile(file), progressPercent(percent),
-          bytesWritten(written), totalBytes(total) {}
+          bytesWritten(written), totalBytes(total), stage(installStage) {}
 
     EventTypeID getEventType() const override { return StaticEventType; }
     const char* getEventName() const override { return "InstallProgress"; }
@@ -117,6 +120,38 @@ struct InstallCompleteEvent : public Event {
 
     EventTypeID getEventType() const override { return StaticEventType; }
     const char* getEventName() const override { return "InstallComplete"; }
+};
+
+struct PersonalizedTicketEvent : public Event {
+    static constexpr EventTypeID StaticEventType = 7;
+
+    std::string titleName;
+    std::string filePath;
+    uint8_t rightsId[16];
+    uint64_t deviceId;
+    uint32_t accountId;
+    void* streamContext;    // Pointer to StreamInstallContext
+
+    PersonalizedTicketEvent() : streamContext(nullptr) {
+        memset(rightsId, 0, sizeof(rightsId));
+        deviceId = 0;
+        accountId = 0;
+    }
+
+    PersonalizedTicketEvent(const std::string& title, const std::string& path,
+                           const uint8_t* rights_id, uint64_t dev_id, uint32_t acc_id,
+                           void* stream_ctx = nullptr)
+        : titleName(title), filePath(path), deviceId(dev_id), accountId(acc_id),
+          streamContext(stream_ctx) {
+        if (rights_id) {
+            memcpy(rightsId, rights_id, sizeof(rightsId));
+        } else {
+            memset(rightsId, 0, sizeof(rightsId));
+        }
+    }
+
+    EventTypeID getEventType() const override { return StaticEventType; }
+    const char* getEventName() const override { return "PersonalizedTicket"; }
 };
 
 } // namespace Javelin

@@ -9,19 +9,15 @@
 #include "mtp/mtp_gamecard.h"
 #include "mtp/mtp_log.h"
 #include "mtp/usb_mtp.h"
+#include "install/stream_install.h"
 #include "core/TransferEvents.h"
 #include "core/Event.h"
 #include "core/Settings.h"
+#include "core/Debug.h"
 #include <string.h>
 #include <malloc.h>
 #include <stdio.h>
 #include <unordered_map>
-
-#if DEBUG
-#define MTP_PROTO_DEBUG 1
-#else
-#define MTP_PROTO_DEBUG 0
-#endif
 
 using namespace Javelin;
 
@@ -68,7 +64,7 @@ static void send_response(MtpProtocolContext* ctx, u16 response_code, u32 transa
         LOG_ERROR("Response 0x%04X: write failed! wrote %zu of %u bytes",
                   response_code, written, hdr->length);
     } else {
-#if MTP_PROTO_DEBUG
+#if DEBUG_MTP_PROTO
         LOG_DEBUG("Response 0x%04X sent OK (%u bytes)", response_code, hdr->length);
 #endif
     }
@@ -92,7 +88,7 @@ static void send_data(MtpProtocolContext* ctx, u16 operation_code, u32 transacti
         LOG_ERROR("Data 0x%04X: write failed! wrote %zu of %u bytes",
                   operation_code, written, hdr->length);
     } else {
-#if MTP_PROTO_DEBUG
+#if DEBUG_MTP_PROTO
         LOG_DEBUG("Data 0x%04X sent OK (%u bytes payload)", operation_code, data_size);
 #endif
     }
@@ -294,7 +290,7 @@ static void handle_get_device_info(MtpProtocolContext* ctx, u32 transaction_id) 
 }
 
 static void handle_open_session(MtpProtocolContext* ctx, u32 transaction_id, u32 session_id) {
-    LOG_INFO("OpenSession: session_id=%u (current: open=%d, id=%u)",
+    LOG_DEBUG("OpenSession: session_id=%u (current: open=%d, id=%u)",
              session_id, ctx->session_open, ctx->session_id);
 
     if (ctx->session_open) {
@@ -306,7 +302,7 @@ static void handle_open_session(MtpProtocolContext* ctx, u32 transaction_id, u32
 
     ctx->session_open = true;
     ctx->session_id = session_id;
-    LOG_INFO("OpenSession: SUCCESS - session %u opened", session_id);
+    LOG_DEBUG("OpenSession: SUCCESS - session %u opened", session_id);
     send_response(ctx, MTP_RESP_OK, transaction_id, NULL, 0);
 }
 
@@ -322,7 +318,7 @@ static void handle_close_session(MtpProtocolContext* ctx, u32 transaction_id) {
 }
 
 static void handle_get_storage_ids(MtpProtocolContext* ctx, u32 transaction_id) {
-    LOG_INFO("GetStorageIDs: session_open=%d", ctx->session_open);
+    LOG_DEBUG("GetStorageIDs: session_open=%d", ctx->session_open);
 
     if (!ctx->session_open) {
         LOG_WARN("GetStorageIDs: Session not open, sending error response");
@@ -335,7 +331,7 @@ static void handle_get_storage_ids(MtpProtocolContext* ctx, u32 transaction_id) 
     u32 storage_ids[16];
     u32 count = mtpStorageGetIds(&ctx->storage, storage_ids, 12);
 
-    LOG_INFO("GetStorageIDs: real storages=%u (sd=%d, user=%d, system=%d)",
+    LOG_DEBUG("GetStorageIDs: real storages=%u (sd=%d, user=%d, system=%d)",
              count, ctx->storage.sdcard.mounted, ctx->storage.user.mounted, ctx->storage.system.mounted);
 
     storage_ids[count++] = MTP_STORAGE_INSTALL_SD;
@@ -348,7 +344,7 @@ static void handle_get_storage_ids(MtpProtocolContext* ctx, u32 transaction_id) 
         storage_ids[count++] = MTP_STORAGE_ALBUM;
     }
 
-    LOG_INFO("GetStorageIDs: returning %u total storages", count);
+    LOG_DEBUG("GetStorageIDs: returning %u total storages", count);
 
     u32 data_size = write_u32_array(data, storage_ids, count);
 
@@ -362,7 +358,7 @@ static void handle_get_storage_info(MtpProtocolContext* ctx, u32 transaction_id,
         return;
     }
 
-#if MTP_PROTO_DEBUG
+#if DEBUG_MTP_PROTO
     LOG_DEBUG("GetStorageInfo: storage_id=0x%08X", storage_id);
 #endif
 
@@ -393,7 +389,7 @@ static void handle_get_storage_info(MtpProtocolContext* ctx, u32 transaction_id,
         return;
     }
 
-    LOG_INFO("GetStorageInfo: storage=0x%08X, desc=%s", storage_id, info.description);
+    LOG_DEBUG("GetStorageInfo: storage=0x%08X, desc=%s", storage_id, info.description);
 
     u8* data = ctx->tx_buffer + sizeof(MtpContainerHeader);
     u8* ptr = data;
@@ -445,7 +441,7 @@ static void handle_get_num_objects(MtpProtocolContext* ctx, u32 transaction_id,
         count = mtpStorageGetObjectCount(&ctx->storage, storage_id, parent_handle);
     }
 
-#if MTP_PROTO_DEBUG
+#if DEBUG_MTP_PROTO
     LOG_DEBUG("GetNumObjects: storage=0x%08X, parent=0x%08X, count=%u",
               storage_id, parent_handle, count);
 #endif
@@ -482,7 +478,7 @@ static void handle_get_object_handles(MtpProtocolContext* ctx, u32 transaction_i
         count = mtpStorageEnumObjects(&ctx->storage, storage_id, parent_handle, handles, 1024);
     }
 
-#if MTP_PROTO_DEBUG
+#if DEBUG_MTP_PROTO
     LOG_DEBUG("GetObjectHandles: returning %u handles", count);
 #endif
 
@@ -525,7 +521,7 @@ static void handle_get_object_info(MtpProtocolContext* ctx, u32 transaction_id, 
         return;
     }
 
-#if MTP_PROTO_DEBUG
+#if DEBUG_MTP_PROTO
     LOG_DEBUG("GetObjectInfo: handle=0x%08X, name=%s", handle, obj.filename);
 #endif
 
@@ -626,7 +622,7 @@ static void handle_get_object(MtpProtocolContext* ctx, u32 transaction_id, u32 h
     }
 
     if (installIsVirtualHandle(handle)) {
-#if MTP_PROTO_DEBUG
+#if DEBUG_MTP_PROTO
         LOG_DEBUG("GetObject: Cannot read from virtual install folder (write-only)");
 #endif
         send_response(ctx, MTP_RESP_GENERAL_ERROR, transaction_id, NULL, 0);
@@ -645,7 +641,7 @@ static void handle_get_object(MtpProtocolContext* ctx, u32 transaction_id, u32 h
             return;
         }
 
-#if MTP_PROTO_DEBUG
+#if DEBUG_MTP_PROTO
         LOG_DEBUG("GetObject (saves): handle=0x%08X, name=%s, size=%lu",
                   handle, obj.filename, (unsigned long)obj.size);
 #endif
@@ -691,7 +687,7 @@ static void handle_get_object(MtpProtocolContext* ctx, u32 transaction_id, u32 h
             return;
         }
 
-#if MTP_PROTO_DEBUG
+#if DEBUG_MTP_PROTO
         LOG_DEBUG("GetObject (dump): handle=0x%08X, name=%s, size=%lu",
                   handle, obj.filename, (unsigned long)obj.size);
 #endif
@@ -825,7 +821,7 @@ static void handle_get_object(MtpProtocolContext* ctx, u32 transaction_id, u32 h
             return;
         }
 
-#if MTP_PROTO_DEBUG
+#if DEBUG_MTP_PROTO
         LOG_DEBUG("GetObject (gamecard): handle=0x%08X, name=%s, size=%llu",
                   handle, obj.filename, (unsigned long long)obj.size);
 #endif
@@ -971,7 +967,7 @@ static void handle_get_object(MtpProtocolContext* ctx, u32 transaction_id, u32 h
         return;
     }
 
-#if MTP_PROTO_DEBUG
+#if DEBUG_MTP_PROTO
     LOG_DEBUG("GetObject: handle=0x%08X, name=%s, size=%lu",
               handle, obj.filename, (unsigned long)obj.size);
 #endif
@@ -1123,6 +1119,7 @@ static u32 g_pending_storage_id = 0;
 static u32 g_pending_parent_handle = 0;
 static u32 g_pending_object_handle = 0;
 static u64 g_pending_object_size = 0;
+static char g_pending_filename[MTP_MAX_FILENAME] = "";
 
 static void handle_send_object_info(MtpProtocolContext* ctx, u32 transaction_id,
                                      u32 storage_id, u32 parent_handle) {
@@ -1131,7 +1128,7 @@ static void handle_send_object_info(MtpProtocolContext* ctx, u32 transaction_id,
         return;
     }
 
-#if MTP_PROTO_DEBUG
+#if DEBUG_MTP_PROTO
     LOG_DEBUG("SendObjectInfo: storage=0x%08X, parent=0x%08X", storage_id, parent_handle);
 #endif
 
@@ -1210,6 +1207,8 @@ static void handle_send_object_info(MtpProtocolContext* ctx, u32 transaction_id,
     g_pending_parent_handle = parent_handle;
     g_pending_object_handle = new_handle;
     g_pending_object_size = obj_size;
+    strncpy(g_pending_filename, filename, sizeof(g_pending_filename) - 1);
+    g_pending_filename[sizeof(g_pending_filename) - 1] = '\0';
 
     u32 params[3] = {storage_id, parent_handle, new_handle};
     send_response(ctx, MTP_RESP_OK, transaction_id, params, 3);
@@ -1244,9 +1243,19 @@ static void handle_send_object(MtpProtocolContext* ctx, u32 transaction_id) {
     bool is_saves = savesIsVirtualStorage(g_pending_storage_id);
 
     MtpObject obj;
-    char obj_filename[MTP_MAX_FILENAME] = "upload";
+    char obj_filename[MTP_MAX_FILENAME];
+    if (g_pending_filename[0] != '\0') {
+        strncpy(obj_filename, g_pending_filename, sizeof(obj_filename) - 1);
+        obj_filename[sizeof(obj_filename) - 1] = '\0';
+    } else {
+        strncpy(obj_filename, "upload", sizeof(obj_filename) - 1);
+        obj_filename[sizeof(obj_filename) - 1] = '\0';
+    }
+
+    // Try to get the actual object name from storage (in case it was updated)
     if (mtpStorageGetObject(&ctx->storage, g_pending_object_handle, &obj)) {
-        snprintf(obj_filename, sizeof(obj_filename), "%s", obj.filename);
+        strncpy(obj_filename, obj.filename, sizeof(obj_filename) - 1);
+        obj_filename[sizeof(obj_filename) - 1] = '\0';
     }
 
     static std::unordered_map<u32, TransferStartEvent*> upload_events;
@@ -1257,6 +1266,12 @@ static void handle_send_object(MtpProtocolContext* ctx, u32 transaction_id) {
     mutexLock(&g_transfer_mutex);
     bool* cancel_ptr = &g_transfer_cancelled[std::string(obj_filename)];
     mutexUnlock(&g_transfer_mutex);
+
+    // Post different events for install vs transfer
+    if (is_install) {
+        InstallStartEvent installStartEvt(obj_filename, obj_filename);
+        EventBus::getInstance().post(installStartEvt);
+    }
 
     TransferStartEvent* startEvent = new TransferStartEvent(obj_filename, g_pending_object_size,
                                                             TransferStartEvent::Direction::Upload);
@@ -1364,6 +1379,38 @@ static void handle_send_object(MtpProtocolContext* ctx, u32 transaction_id) {
                     u64 recent_bytes = total_written - last_progress_bytes;
                     float speed = (recent_sec > 0.01f) ? (recent_bytes / (1024.0f * 1024.0f)) / recent_sec : 0.0f;
 
+                    // Post install-specific events with stage information
+                    if (is_install && ctx->install.stream_ctx) {
+                        // Check if we need to prompt user about personalized ticket (only once)
+                        if (streamInstallShouldPostTicketEvent(ctx->install.stream_ctx)) {
+                            u8 rights_id[16];
+                            u64 device_id;
+                            u32 account_id;
+                            if (streamInstallGetTicketInfo(ctx->install.stream_ctx, rights_id, &device_id, &account_id)) {
+                                const char* display_name = ctx->install.stream_ctx->filename;
+                                if (display_name[0] == '\0') {
+                                    display_name = obj_filename;
+                                }
+                                PersonalizedTicketEvent ticketEvt(display_name, display_name,
+                                                                 rights_id, device_id, account_id,
+                                                                 ctx->install.stream_ctx);
+                                EventBus::getInstance().post(ticketEvt);
+                                LOG_INFO("MTP: Posted PersonalizedTicketEvent for %s", display_name);
+                            }
+                        }
+
+                        const char* stage = streamInstallGetStageString(ctx->install.stream_ctx);
+
+                        // Use filename from stream context instead of MTP object name
+                        const char* display_name = ctx->install.stream_ctx->filename;
+                        if (display_name[0] == '\0') {
+                            display_name = obj_filename;  // Fallback to MTP object name
+                        }
+
+                        InstallProgressEvent installProgressEvt(display_name, "", percent, total_written, data_size, stage);
+                        EventBus::getInstance().post(installProgressEvt);
+                    }
+
                     TransferProgressEvent progressEvent(obj_filename, total_written, data_size, percent, speed);
                     EventBus::getInstance().post(progressEvent);
                     last_progress_ticks = now_ticks;
@@ -1414,6 +1461,13 @@ static void handle_send_object(MtpProtocolContext* ctx, u32 transaction_id) {
         float elapsed_sec = (float)((double)elapsed_ticks / armGetSystemTickFreq());
         float speed = (elapsed_sec > 0) ? (total_written / (1024.0f * 1024.0f)) / elapsed_sec : 0.0f;
 
+        // Post install-specific final progress event with stage
+        if (is_install && ctx->install.stream_ctx) {
+            const char* stage = streamInstallGetStageString(ctx->install.stream_ctx);
+            InstallProgressEvent installProgressEvt(obj_filename, "", percent, total_written, data_size, stage);
+            EventBus::getInstance().post(installProgressEvt);
+        }
+
         TransferProgressEvent progressEvent(obj_filename, total_written, data_size, percent, speed);
         EventBus::getInstance().post(progressEvent);
     }
@@ -1426,6 +1480,7 @@ static void handle_send_object(MtpProtocolContext* ctx, u32 transaction_id) {
     g_pending_object_handle = 0;
     g_pending_object_size = 0;
     g_pending_storage_id = 0;
+    g_pending_filename[0] = '\0';
 
     bool transfer_success = (total_written > 0 || data_size == 0);
 
@@ -1450,6 +1505,13 @@ static void handle_send_object(MtpProtocolContext* ctx, u32 transaction_id) {
             mtpStorageDeleteObject(&ctx->storage, saved_handle);
             transfer_success = false;
         }
+    }
+
+    // Post install-specific complete event
+    if (was_install) {
+        InstallCompleteEvent installCompleteEvt(obj_filename, transfer_success,
+                                               transfer_success ? "" : (was_cancelled ? "Installation cancelled" : "Installation failed"));
+        EventBus::getInstance().post(installCompleteEvt);
     }
 
     TransferCompleteEvent completeEvent(obj_filename, total_written, transfer_success,
@@ -1561,7 +1623,7 @@ bool mtpProtocolProcess(MtpProtocolContext* ctx) {
     if (!usbMtpIsReady()) {
         s_usb_check_count++;
         if (s_usb_check_count % 1000 == 1) {
-#if MTP_PROTO_DEBUG
+#if DEBUG_MTP_PROTO
             LOG_DEBUG("Waiting for USB host to configure device...");
 #endif
         }
@@ -1603,7 +1665,7 @@ bool mtpProtocolProcess(MtpProtocolContext* ctx) {
         u32* params = (u32*)(ctx->rx_buffer + sizeof(MtpContainerHeader));
         u32 payload_size = hdr->length - sizeof(MtpContainerHeader);
 
-        LOG_INFO("MTP Command: 0x%04X, txn=%u, payload=%u bytes",
+        LOG_DEBUG("MTP Command: 0x%04X, txn=%u, payload=%u bytes",
                  hdr->code, hdr->transaction_id, payload_size);
 
         switch (hdr->code) {

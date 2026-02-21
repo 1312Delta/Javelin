@@ -80,6 +80,7 @@ typedef struct {
     CnmtContext cnmt_ctx;
     NcmContentId cnmt_id;
     u64 cnmt_size;
+    bool cnmt_scanned;  // Track if we've already scanned for CNMT location
 
     // Ticket/Certificate caching for encrypted content
     u8* ticket_data;
@@ -87,6 +88,10 @@ typedef struct {
     u8* cert_data;
     u32 cert_size;
     bool ticket_imported;
+    bool ticket_is_personalized;
+    bool ticket_conversion_approved;
+    bool waiting_for_user_response;
+    bool ticket_event_posted;  // Track if PersonalizedTicketEvent was already posted
 
     // Pre-allocated write buffer for NCA installation (avoids per-call malloc)
     u8* write_buffer;
@@ -106,6 +111,11 @@ StreamInstallState streamInstallGetState(const StreamInstallContext* ctx);
 float streamInstallGetProgress(const StreamInstallContext* ctx);
 u64 streamInstallGetTitleId(const StreamInstallContext* ctx);
 void streamInstallReset(StreamInstallContext* ctx);
+const char* streamInstallGetStageString(const StreamInstallContext* ctx);
+bool streamInstallIsWaitingForTicketResponse(const StreamInstallContext* ctx);
+bool streamInstallGetTicketInfo(const StreamInstallContext* ctx, u8* out_rights_id, u64* out_device_id, u32* out_account_id);
+void streamInstallSetTicketConversionApproved(StreamInstallContext* ctx, bool approved);
+bool streamInstallShouldPostTicketEvent(StreamInstallContext* ctx);
 
 #ifdef __cplusplus
 }

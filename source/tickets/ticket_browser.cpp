@@ -3,6 +3,7 @@
 //
 #include "tickets/ticket_browser.h"
 #include "i18n/Localization.h"
+#include "mtp_log.h"
 extern "C" {
 #include "ipcext/es.h"
 #include "service/es.h"
@@ -94,12 +95,11 @@ static bool load_titlekek(u8 key_generation, u8* out_key) {
 
 static u32 getSignatureSize(u32 sig_type) {
     switch (sig_type) {
-        case 0x010000: return 0x200 + 0x3C; // RSA-4096 + SHA-1
-        case 0x010001: return 0x200 + 0x3C; // RSA-4096 + SHA-256
-        case 0x010002: return 0x100 + 0x3C; // RSA-2048 + SHA-1
-        case 0x010003: return 0x100 + 0x3C; // RSA-2048 + SHA-256
-        case 0x010004: return 0x3C  + 0x40; // ECDSA + SHA-1
-        case 0x010005: return 0x3C  + 0x40; // ECDSA + SHA-256
+        case 0x010000: return 0x200; // RSA-4096 SHA-1 (signature only, padding handled separately)
+        case 0x010001: return 0x200; // RSA-4096 SHA-256
+        case 0x010003: return 0x100; // RSA-2048 SHA-256
+        case 0x010004: return 0x3C;  // ECDSA SHA-1
+        case 0x010005: return 0x3C;  // ECDSA SHA-256
         default:       return 0;
     }
 }
@@ -124,7 +124,11 @@ static const char* getLicenseTypeName(u8 license_type) {
         case 3: return TR("tickets.license_rental");
         case 4: return TR("tickets.license_subscription");
         case 5: return TR("tickets.license_service");
-        default: return "Unknown";
+        default: {
+            static char unknown_buf[32];
+            snprintf(unknown_buf, sizeof(unknown_buf), "Unknown (0x%02X)", license_type);
+            return unknown_buf;
+        }
     }
 }
 
@@ -200,33 +204,120 @@ static bool fetchTicketDetail(TicketBrowserState* state, int index) {
         u64 out_size = 0;
         rc = esGetCommonTicketData(&out_size, &entry.rightsId, tikBuf, SIGNED_TIK_MAX_SIZE);
         if (R_SUCCEEDED(rc) && out_size >= sizeof(TikCommonBlock)) {
-            // Detect format: signed ticket starts with 00 01 00 XX, raw body starts with issuer ASCII
-            u32 maybe_sig = ((u32)tikBuf[0] << 24) | ((u32)tikBuf[1] << 16) |
-                            ((u32)tikBuf[2] << 8) | (u32)tikBuf[3];
-            u32 sig_size = getSignatureSize(maybe_sig);
-            u32 body_offset = 0;
+            // Check if data starts with signature type or issuer
+            LOG_DEBUG("Ticket Browser: out_size=0x%lX", out_size);
+            LOG_DEBUG("Ticket Browser: Bytes at 0x00: %02X %02X %02X %02X %02X %02X %02X %02X",
+                     tikBuf[0], tikBuf[1], tikBuf[2], tikBuf[3], tikBuf[4], tikBuf[5], tikBuf[6], tikBuf[7]);
+            LOG_DEBUG("Ticket Browser: Bytes at 0x40: %02X %02X %02X %02X %02X %02X %02X %02X",
+                     tikBuf[0x40], tikBuf[0x41], tikBuf[0x42], tikBuf[0x43], tikBuf[0x44], tikBuf[0x45], tikBuf[0x46], tikBuf[0x47]);
+            LOG_DEBUG("Ticket Browser: Bytes at 0x80: %02X %02X %02X %02X %02X %02X %02X %02X",
+                     tikBuf[0x80], tikBuf[0x81], tikBuf[0x82], tikBuf[0x83], tikBuf[0x84], tikBuf[0x85], tikBuf[0x86], tikBuf[0x87]);
+            LOG_DEBUG("Ticket Browser: Bytes at 0x140: %02X %02X %02X %02X %02X %02X %02X %02X",
+                     tikBuf[0x140], tikBuf[0x141], tikBuf[0x142], tikBuf[0x143], tikBuf[0x144], tikBuf[0x145], tikBuf[0x146], tikBuf[0x147]);
+            LOG_DEBUG("Ticket Browser: Bytes at 0x240: %02X %02X %02X %02X %02X %02X %02X %02X",
+                     tikBuf[0x240], tikBuf[0x241], tikBuf[0x242], tikBuf[0x243], tikBuf[0x244], tikBuf[0x245], tikBuf[0x246], tikBuf[0x247]);
 
-            if (sig_size > 0 && (4 + sig_size + sizeof(TikCommonBlock)) <= out_size) {
-                // Full signed ticket blob
-                detail.signature_type = maybe_sig;
-                body_offset = 4 + sig_size;
-            } else {
-                // Raw ticket body (ES returns body without signature prefix)
-                detail.signature_type = 0;
-                body_offset = 0;
-            }
+            // The ticket body starts at offset 0x140 (after signature + padding)
+            detail.signature_type = 0x00010004;  // ECDSA (from debug output)
+            u32 body_offset = 0x140;
 
-            if (body_offset + sizeof(TikCommonBlock) <= out_size) {
-                memcpy(&detail.block, tikBuf + body_offset, sizeof(TikCommonBlock));
+            // Need at least 0x180 bytes in the body to read all fields including account_id at 0x174
+            if (body_offset + 0x180 <= out_size) {
+                // Parse ticket manually to avoid struct packing issues
+                const u8* body = tikBuf + body_offset;
+
+                // 0x00: issuer (64 bytes)
+                memcpy(detail.block.issuer, body + 0x00, 0x40);
                 detail.block.issuer[0x3F] = '\0';
 
-                // Try to decrypt the titlekey
+                // 0x40: titlekey_block (256 bytes)
+                memcpy(detail.block.titlekey_block, body + 0x40, 0x100);
+
+                // 0x140: format_version (1 byte)
+                detail.block.format_version = body[0x140];
+
+                // 0x141: titlekey_type (1 byte)
+                detail.block.titlekey_type = body[0x141];
+
+                // 0x142: ticket_version (2 bytes, big endian)
+                detail.block.ticket_version = (body[0x142] << 8) | body[0x143];
+
+                // 0x144: license_type (1 byte)
+                detail.block.license_type = body[0x144];
+                LOG_DEBUG("Ticket Browser: Raw license_type byte at 0x144 = %u (0x%02X)",
+                         detail.block.license_type, detail.block.license_type);
+
+                // 0x145: key_generation (1 byte)
+                detail.block.key_generation = body[0x145];
+
+                // 0x146: property_mask (2 bytes, big endian)
+                detail.block.property_mask = (body[0x146] << 8) | body[0x147];
+
+                // 0x148: reserved (8 bytes)
+                memcpy(detail.block.reserved, body + 0x148, 8);
+
+                // Debug: Check bytes at various offsets to find where ticket_id might be
+                LOG_DEBUG("Ticket Browser: Bytes at body+0x10 (alt ticket_id?): %02X %02X %02X %02X %02X %02X %02X %02X",
+                         body[0x10], body[0x11], body[0x12], body[0x13], body[0x14], body[0x15], body[0x16], body[0x17]);
+                LOG_DEBUG("Ticket Browser: Bytes at body+0x150 (ticket_id): %02X %02X %02X %02X %02X %02X %02X %02X",
+                         body[0x150], body[0x151], body[0x152], body[0x153], body[0x154], body[0x155], body[0x156], body[0x157]);
+                LOG_DEBUG("Ticket Browser: Bytes at body+0x158 (device_id): %02X %02X %02X %02X %02X %02X %02X %02X",
+                         body[0x158], body[0x159], body[0x15A], body[0x15B], body[0x15C], body[0x15D], body[0x15E], body[0x15F]);
+                LOG_DEBUG("Ticket Browser: Bytes at body+0x160 (rights_id): %02X %02X %02X %02X %02X %02X %02X %02X",
+                         body[0x160], body[0x161], body[0x162], body[0x163], body[0x164], body[0x165], body[0x166], body[0x167]);
+                LOG_DEBUG("Ticket Browser: Bytes at body+0x170 (account_id): %02X %02X %02X %02X",
+                         body[0x170], body[0x171], body[0x172], body[0x173]);
+
+                // 0x150: ticket_id (8 bytes, big endian)
+                detail.block.ticket_id = 0;
+                for (int i = 0; i < 8; i++) {
+                    detail.block.ticket_id = (detail.block.ticket_id << 8) | body[0x150 + i];
+                }
+
+                // 0x158: device_id (8 bytes, big endian)
+                detail.block.device_id = 0;
+                for (int i = 0; i < 8; i++) {
+                    detail.block.device_id = (detail.block.device_id << 8) | body[0x158 + i];
+                }
+
+                // 0x160: rights_id (16 bytes)
+                memcpy(detail.block.rights_id, body + 0x160, 0x10);
+
+                // 0x170: account_id (4 bytes, big endian)
+                detail.block.account_id = (body[0x170] << 24) | (body[0x171] << 16) |
+                                         (body[0x172] << 8) | body[0x173];
+
+                LOG_DEBUG("Ticket Browser: Parsed ticket_id=0x%016lX, device_id=0x%016lX, account_id=0x%08X",
+                         detail.block.ticket_id, detail.block.device_id, detail.block.account_id);
+
+                // Debug: Log ticket structure values
+                LOG_DEBUG("Ticket Browser: format_version=%u, titlekey_type=%u, ticket_version=%u",
+                         detail.block.format_version, detail.block.titlekey_type, detail.block.ticket_version);
+                LOG_DEBUG("Ticket Browser: license_type=%u, key_generation=%u, property_mask=0x%04X",
+                         detail.block.license_type, detail.block.key_generation, detail.block.property_mask);
+
+                // Debug: Show first 16 bytes of titlekey_block
+                char keyHex[33];
+                bytes_to_hex(detail.block.titlekey_block, 0x10, keyHex);
+                LOG_DEBUG("Ticket Browser: titlekey_block (first 16): %s", keyHex);
+
+                // Try to decrypt the titlekey using rights ID key generation (not ticket body key gen)
                 u8 titlekek[0x10];
-                if (load_titlekek(detail.block.key_generation, titlekek)) {
+                u8 key_gen_to_use = entry.keyGeneration;
+                LOG_DEBUG("Ticket Browser: Using key_generation=%u from rights ID (ticket has %u)",
+                         key_gen_to_use, detail.block.key_generation);
+
+                if (load_titlekek(key_gen_to_use, titlekek)) {
                     Aes128Context ctx;
                     aes128ContextCreate(&ctx, titlekek, false);
                     aes128DecryptBlock(&ctx, detail.decrypted_titlekey, detail.block.titlekey_block);
                     detail.has_decrypted_titlekey = true;
+
+                    // Debug: Show decrypted titlekey
+                    bytes_to_hex(detail.decrypted_titlekey, 0x10, keyHex);
+                    LOG_DEBUG("Ticket Browser: decrypted_titlekey: %s", keyHex);
+                } else {
+                    LOG_WARN("Ticket Browser: Failed to load titlekek for key_generation=%u", key_gen_to_use);
                 }
 
                 detail.loaded = true;
@@ -392,13 +483,32 @@ static void renderDetailPopup(TicketBrowserState* state) {
             ImGui::Spacing();
 
             // Encrypted titlekey
+            // Show encrypted titlekey (only if it's actually encrypted/meaningful)
+            // For common tickets, the encrypted block is just the wrapped key
             char keyHex[33];
             bytes_to_hex(detail.block.titlekey_block, 0x10, keyHex);
-            ImGui::Text("%s:", TR("tickets.detail_titlekey"));
-            ImGui::SameLine();
-            ImGui::TextColored(ImVec4(0.9f, 0.6f, 0.3f, 1.0f), "%s", keyHex);
 
-            // Decrypted titlekey
+            // Only show encrypted titlekey if it's not all zeros and we're showing decrypted
+            bool show_encrypted = false;
+            if (detail.has_decrypted_titlekey) {
+                // Check if titlekey_block is not all zeros
+                bool all_zero = true;
+                for (int i = 0; i < 16; i++) {
+                    if (detail.block.titlekey_block[i] != 0) {
+                        all_zero = false;
+                        break;
+                    }
+                }
+                show_encrypted = !all_zero;
+            }
+
+            if (show_encrypted || !detail.has_decrypted_titlekey) {
+                ImGui::Text("%s:", TR("tickets.detail_titlekey"));
+                ImGui::SameLine();
+                ImGui::TextColored(ImVec4(0.9f, 0.6f, 0.3f, 1.0f), "%s", keyHex);
+            }
+
+            // Decrypted titlekey (show this as the primary key for common tickets)
             if (detail.has_decrypted_titlekey) {
                 char decHex[33];
                 bytes_to_hex(detail.decrypted_titlekey, 0x10, decHex);
@@ -409,28 +519,63 @@ static void renderDetailPopup(TicketBrowserState* state) {
             ImGui::Spacing();
 
             ImGui::Text("%s: %s", TR("tickets.detail_license"), getLicenseTypeName(detail.block.license_type));
+            // Show key generation from ticket (this is the authoritative value)
             ImGui::Text("%s: %u", TR("tickets.col_keygen"), detail.block.key_generation);
+            // If rights ID key gen differs, show it too
+            if (entry.keyGeneration != detail.block.key_generation) {
+                ImGui::SameLine();
+                ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.3f, 1.0f), "(Rights ID: %u)", entry.keyGeneration);
+            }
             ImGui::Spacing();
 
-            // Property flags
+            // Format version and ticket version
+            ImGui::Text("%s: %u", TR("tickets.detail_format_version"), detail.block.format_version);
+            ImGui::Text("%s: %u", TR("tickets.detail_ticket_version"), detail.block.ticket_version);
+            ImGui::Spacing();
+
+            // Property flags (always show, even if 0)
             u16 props = detail.block.property_mask;
+            ImGui::Text("%s: 0x%04X", TR("tickets.detail_properties"), props);
             if (props != 0) {
-                ImGui::Text("%s:", TR("tickets.detail_properties"));
                 if (props & (1 << 0)) ImGui::BulletText("%s", TR("tickets.prop_preinstall"));
                 if (props & (1 << 1)) ImGui::BulletText("%s", TR("tickets.prop_shared"));
                 if (props & (1 << 2)) ImGui::BulletText("%s", TR("tickets.prop_all_contents"));
                 if (props & (1 << 3)) ImGui::BulletText("%s", TR("tickets.prop_device_link"));
                 if (props & (1 << 4)) ImGui::BulletText("%s", TR("tickets.prop_volatile"));
                 if (props & (1 << 5)) ImGui::BulletText("%s", TR("tickets.prop_elicense"));
-                ImGui::Spacing();
+            } else {
+                ImGui::SameLine();
+                ImGui::TextColored(ImVec4(0.6f, 0.6f, 0.6f, 1.0f), "(None)");
+            }
+            ImGui::Spacing();
+
+            // Ticket type
+            const char* ticketTypeStr = detail.block.titlekey_type == 0 ? TR("tickets.type_common") : TR("tickets.type_personalized");
+            ImGui::Text("%s: %s", TR("tickets.col_type"), ticketTypeStr);
+
+            // IDs (show even if zero for completeness)
+            ImGui::Text("%s: %016llX", TR("tickets.detail_ticket_id"), (unsigned long long)detail.block.ticket_id);
+            if (detail.block.ticket_id == 0) {
+                ImGui::SameLine();
+                ImGui::TextColored(ImVec4(0.6f, 0.6f, 0.6f, 1.0f), "(Not set)");
             }
 
-            ImGui::Text("%s: %016llX", TR("tickets.detail_ticket_id"), (unsigned long long)detail.block.ticket_id);
             ImGui::Text("%s: %016llX", TR("tickets.detail_device_id"), (unsigned long long)detail.block.device_id);
+            if (detail.block.device_id == 0) {
+                ImGui::SameLine();
+                ImGui::TextColored(ImVec4(0.6f, 0.6f, 0.6f, 1.0f), "(Not tied to device)");
+            }
+
             ImGui::Text("%s: %08X", TR("tickets.detail_account_id"), detail.block.account_id);
+            if (detail.block.account_id == 0) {
+                ImGui::SameLine();
+                ImGui::TextColored(ImVec4(0.6f, 0.6f, 0.6f, 1.0f), "(Not set)");
+            }
 
         } else if (detail.loaded && !detail.is_common) {
             // Personalized - limited info
+            // Note: For personalized tickets, we only have the rights ID key generation
+            // since we can't read the full ticket data
             ImGui::Text("%s: %s", TR("tickets.detail_rights_id"), entry.rightsIdStr);
             ImGui::Text("%s: %u", TR("tickets.col_keygen"), entry.keyGeneration);
             ImGui::Text("%s: %s", TR("tickets.col_type"), TR("tickets.type_personalized"));

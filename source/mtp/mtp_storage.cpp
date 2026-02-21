@@ -6,6 +6,7 @@
 #include "install/fat32.h"
 #include "core/TransferEvents.h"
 #include "core/Event.h"
+#include "core/Debug.h"
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -17,12 +18,6 @@
 #include <unordered_map>
 
 using namespace Javelin;
-
-#if DEBUG
-#define STORAGE_DEBUG 1
-#else
-#define STORAGE_DEBUG 0
-#endif
 
 static bool folder_is_scanned(MtpStorageContext* ctx, u32 storage_id, u32 folder_handle);
 static void mark_folder_scanned(MtpStorageContext* ctx, u32 storage_id, u32 folder_handle);
@@ -92,7 +87,7 @@ static u32 get_storage_from_handle(u32 handle) {
 static u32 add_object_unlocked(MtpStorageContext* ctx, u32 storage_id, u32 parent_handle,
                       const char* path, const char* filename, u8 obj_type, u64 size) {
     if (!ctx->objects || ctx->object_count >= ctx->max_objects) {
-#if STORAGE_DEBUG
+#if DEBUG_MTP_STORAGE
         LOG_ERROR("Object cache full! (%u/%u)", ctx->object_count, ctx->max_objects);
 #endif
         return 0;
@@ -216,13 +211,13 @@ Result mtpStorageInit(MtpStorageContext* ctx) {
     memset(ctx, 0, sizeof(MtpStorageContext));
     mutexInit(&ctx->cache_mutex);
 
-#if STORAGE_DEBUG
+#if DEBUG_MTP_STORAGE
     LOG_INFO("Initializing MTP storage...");
 #endif
 
     Result rc = fsInitialize();
     if (R_FAILED(rc)) {
-#if STORAGE_DEBUG
+#if DEBUG_MTP_STORAGE
         LOG_WARN("fsInitialize failed: 0x%08X (may already be initialized)", rc);
 #endif
     }
@@ -235,7 +230,7 @@ Result mtpStorageInit(MtpStorageContext* ctx) {
 
     ctx->objects = (MtpObject*)malloc(sizeof(MtpObject) * MTP_MAX_OBJECTS);
     if (!ctx->objects) {
-#if STORAGE_DEBUG
+#if DEBUG_MTP_STORAGE
         LOG_ERROR("Failed to allocate object array!");
 #endif
         return MAKERESULT(Module_Libnx, LibnxError_OutOfMemory);
@@ -256,14 +251,14 @@ Result mtpStorageInit(MtpStorageContext* ctx) {
         ctx->sdcard.max_capacity = (u64)vfs.f_blocks * vfs.f_frsize;
         ctx->sdcard.free_space = (u64)vfs.f_bfree * vfs.f_frsize;
         ctx->sdcard.mounted = true;
-#if STORAGE_DEBUG
+#if DEBUG_MTP_STORAGE
         LOG_INFO("SD Card: %lu MB total, %lu MB free",
                (unsigned long)(ctx->sdcard.max_capacity / (1024*1024)),
                (unsigned long)(ctx->sdcard.free_space / (1024*1024)));
 #endif
     } else {
         ctx->sdcard.mounted = false;
-#if STORAGE_DEBUG
+#if DEBUG_MTP_STORAGE
         LOG_WARN("SD Card not accessible");
 #endif
     }
@@ -285,7 +280,7 @@ Result mtpStorageInit(MtpStorageContext* ctx) {
 
     ctx->user.mounted = false;
 
-#if STORAGE_DEBUG
+#if DEBUG_MTP_STORAGE
     LOG_DEBUG("Attempting BIS USER partition...");
 #endif
     rc = fsOpenBisFileSystem(&ctx->user_fs, FsBisPartitionId_User, "");
@@ -298,24 +293,24 @@ Result mtpStorageInit(MtpStorageContext* ctx) {
                 ctx->user.max_capacity = (u64)user_vfs.f_blocks * user_vfs.f_frsize;
                 ctx->user.free_space = (u64)user_vfs.f_bfree * user_vfs.f_frsize;
                 ctx->user.mounted = true;
-#if STORAGE_DEBUG
+#if DEBUG_MTP_STORAGE
                 LOG_INFO("BIS USER mounted: %lu MB",
                        (unsigned long)(ctx->user.max_capacity / (1024*1024)));
 #endif
             }
         } else {
             fsFsClose(&ctx->user_fs);
-#if STORAGE_DEBUG
+#if DEBUG_MTP_STORAGE
             LOG_WARN("fsdevMountDevice USER failed: %d", mount_result);
 #endif
         }
     } else {
-#if STORAGE_DEBUG
+#if DEBUG_MTP_STORAGE
         LOG_DEBUG("fsOpenBisFileSystem USER: 0x%08X", rc);
 #endif
     }
 
-#if STORAGE_DEBUG
+#if DEBUG_MTP_STORAGE
     LOG_DEBUG("Attempting BIS SYSTEM partition...");
 #endif
     rc = fsOpenBisFileSystem(&ctx->system_fs, FsBisPartitionId_System, "");
@@ -329,19 +324,19 @@ Result mtpStorageInit(MtpStorageContext* ctx) {
                 ctx->system.max_capacity = (u64)sys_vfs.f_blocks * sys_vfs.f_frsize;
                 ctx->system.free_space = (u64)sys_vfs.f_bfree * sys_vfs.f_frsize;
                 ctx->system.mounted = true;
-#if STORAGE_DEBUG
+#if DEBUG_MTP_STORAGE
                 LOG_INFO("BIS SYSTEM mounted: %lu MB",
                        (unsigned long)(ctx->system.max_capacity / (1024*1024)));
 #endif
             }
         } else {
             fsFsClose(&ctx->system_fs);
-#if STORAGE_DEBUG
+#if DEBUG_MTP_STORAGE
             LOG_WARN("fsdevMountDevice SYSTEM failed: %d", mount_result);
 #endif
         }
     } else {
-#if STORAGE_DEBUG
+#if DEBUG_MTP_STORAGE
         LOG_DEBUG("fsOpenBisFileSystem SYSTEM: 0x%08X", rc);
 #endif
     }
@@ -366,7 +361,7 @@ Result mtpStorageInit(MtpStorageContext* ctx) {
             ctx->album.mounted = true;
             album_found = true;
             ctx->album_on_nand = false;
-#if STORAGE_DEBUG
+#if DEBUG_MTP_STORAGE
             LOG_INFO("Album: mounted (sdmc:/Nintendo/Album)");
 #endif
         }
@@ -381,7 +376,7 @@ Result mtpStorageInit(MtpStorageContext* ctx) {
                 ctx->album.mounted = true;
                 album_found = true;
                 ctx->album_on_nand = true;
-#if STORAGE_DEBUG
+#if DEBUG_MTP_STORAGE
                 LOG_INFO("Album: mounted (user:/Nintendo/Album)");
 #endif
             }
@@ -389,13 +384,13 @@ Result mtpStorageInit(MtpStorageContext* ctx) {
     }
 
     if (!album_found) {
-#if STORAGE_DEBUG
+#if DEBUG_MTP_STORAGE
         LOG_DEBUG("Album directory not found on SD or NAND USER");
 #endif
     }
 
     if (!ctx->user.mounted) {
-#if STORAGE_DEBUG
+#if DEBUG_MTP_STORAGE
         LOG_DEBUG("Checking save:/ access...");
 #endif
         struct statvfs save_vfs;
@@ -405,7 +400,7 @@ Result mtpStorageInit(MtpStorageContext* ctx) {
             ctx->user.mounted = true;
             strncpy(ctx->user.description, "Save Data", sizeof(ctx->user.description));
             strncpy(ctx->user.volume_label, "SAVE", sizeof(ctx->user.volume_label));
-#if STORAGE_DEBUG
+#if DEBUG_MTP_STORAGE
             LOG_INFO("save:/ accessible: %lu MB",
                    (unsigned long)(ctx->user.max_capacity / (1024*1024)));
 #endif
@@ -413,7 +408,7 @@ Result mtpStorageInit(MtpStorageContext* ctx) {
     }
 
     if (!ctx->user.mounted) {
-#if STORAGE_DEBUG
+#if DEBUG_MTP_STORAGE
         LOG_WARN("Internal storage not accessible (need title override)");
 #endif
     }
@@ -437,7 +432,7 @@ Result mtpStorageInit(MtpStorageContext* ctx) {
 }
 
 void mtpStorageExit(MtpStorageContext* ctx) {
-#if STORAGE_DEBUG
+#if DEBUG_MTP_STORAGE
     LOG_INFO("Shutting down MTP storage");
 #endif
 
@@ -489,7 +484,7 @@ const char* mtpStorageGetBasePath(MtpStorageContext* ctx, u32 storage_id) {
 }
 
 void mtpStorageRefresh(MtpStorageContext* ctx, u32 storage_id) {
-#if STORAGE_DEBUG
+#if DEBUG_MTP_STORAGE
     LOG_DEBUG("Refreshing storage 0x%08X", storage_id);
 #endif
 
@@ -545,7 +540,7 @@ void mtpStorageRefresh(MtpStorageContext* ctx, u32 storage_id) {
         mark_folder_scanned(ctx, MTP_STORAGE_ALBUM, 0xFFFFFFFF);
     }
 
-#if STORAGE_DEBUG
+#if DEBUG_MTP_STORAGE
     LOG_DEBUG("Refresh complete. Objects: %u", ctx->object_count);
 #endif
 }
@@ -797,7 +792,7 @@ s64 mtpStorageReadObject(MtpStorageContext* ctx, u32 handle, u64 offset, void* b
 
     FILE* f = fopen(obj.full_path, "rb");
     if (!f) {
-#if STORAGE_DEBUG
+#if DEBUG_MTP_STORAGE
         LOG_WARN("Failed to open file: %s", obj.full_path);
 #endif
         return -1;
@@ -829,7 +824,7 @@ s64 mtpStorageWriteObject(MtpStorageContext* ctx, u32 handle, u64 offset, const 
     if (!f) {
         f = fopen(obj.full_path, "wb");
         if (!f) {
-#if STORAGE_DEBUG
+#if DEBUG_MTP_STORAGE
             LOG_WARN("Failed to open for writing: %s", obj.full_path);
 #endif
             return -1;
@@ -845,7 +840,7 @@ s64 mtpStorageWriteObject(MtpStorageContext* ctx, u32 handle, u64 offset, const 
     size_t written = fwrite(buffer, 1, size, f);
     fclose(f);
 
-#if STORAGE_DEBUG
+#if DEBUG_MTP_STORAGE
     LOG_DEBUG("Wrote %zu bytes to %s", written, obj.full_path);
 #endif
 
@@ -985,7 +980,7 @@ static void remove_object_at_index(MtpStorageContext* ctx, u32 index) {
 u32 mtpStorageCreateObject(MtpStorageContext* ctx, u32 storage_id, u32 parent_handle,
                            const char* filename, u16 format, u64 size) {
     if (!ctx->objects || ctx->object_count >= ctx->max_objects) {
-#if STORAGE_DEBUG
+#if DEBUG_MTP_STORAGE
         LOG_WARN("Cannot create object: cache full");
 #endif
         return 0;
@@ -998,7 +993,7 @@ u32 mtpStorageCreateObject(MtpStorageContext* ctx, u32 storage_id, u32 parent_ha
         if (!base) return 0;
         int written = snprintf(full_path, sizeof(full_path), "%s%s", base, filename);
         if (written < 0 || (size_t)written >= sizeof(full_path)) {
-#if STORAGE_DEBUG
+#if DEBUG_MTP_STORAGE
             LOG_WARN("Path too long for root object: %s", filename);
 #endif
             return 0;
@@ -1010,7 +1005,7 @@ u32 mtpStorageCreateObject(MtpStorageContext* ctx, u32 storage_id, u32 parent_ha
         }
         int written = snprintf(full_path, sizeof(full_path), "%s/%s", parent.full_path, filename);
         if (written < 0 || (size_t)written >= sizeof(full_path)) {
-#if STORAGE_DEBUG
+#if DEBUG_MTP_STORAGE
             LOG_WARN("Path too long: %s/%s", parent.full_path, filename);
 #endif
             return 0;
@@ -1021,24 +1016,24 @@ u32 mtpStorageCreateObject(MtpStorageContext* ctx, u32 storage_id, u32 parent_ha
 
     if (is_folder) {
         if (mkdir(full_path, 0755) != 0) {
-#if STORAGE_DEBUG
+#if DEBUG_MTP_STORAGE
             LOG_WARN("Failed to create dir: %s", full_path);
 #endif
             return 0;
         }
-#if STORAGE_DEBUG
+#if DEBUG_MTP_STORAGE
         LOG_INFO("Created dir: %s", full_path);
 #endif
     } else {
         FILE* f = fopen(full_path, "wb");
         if (!f) {
-#if STORAGE_DEBUG
+#if DEBUG_MTP_STORAGE
             LOG_WARN("Failed to create file: %s", full_path);
 #endif
             return 0;
         }
         fclose(f);
-#if STORAGE_DEBUG
+#if DEBUG_MTP_STORAGE
         LOG_INFO("Created file: %s", full_path);
 #endif
     }
@@ -1104,7 +1099,7 @@ bool mtpStorageDeleteObject(MtpStorageContext* ctx, u32 handle) {
     }
 
     if (success) {
-#if STORAGE_DEBUG
+#if DEBUG_MTP_STORAGE
         LOG_INFO("Deleted: %s", obj->full_path);
 #endif
         idx = find_object_index(ctx, handle);
@@ -1112,7 +1107,7 @@ bool mtpStorageDeleteObject(MtpStorageContext* ctx, u32 handle) {
             remove_object_at_index(ctx, idx);
         }
     } else {
-#if STORAGE_DEBUG
+#if DEBUG_MTP_STORAGE
         LOG_WARN("Failed to delete: %s", obj->full_path);
 #endif
     }

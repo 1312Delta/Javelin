@@ -57,6 +57,16 @@ struct InstallProgress {
     bool* cancelledPtr;  // Pointer to cancelled flag in the event
 };
 
+struct PersonalizedTicketPrompt {
+    std::string titleName;
+    std::string filePath;
+    uint8_t rightsId[16];
+    uint64_t deviceId;
+    uint32_t accountId;
+    bool active;
+    void* streamContext;  // Pointer to StreamInstallContext
+};
+
 class GuiManager {
 public:
     static GuiManager& getInstance() {
@@ -86,16 +96,19 @@ private:
     void onInstallStart(const InstallStartEvent& event);
     void onInstallProgress(const InstallProgressEvent& event);
     void onInstallComplete(const InstallCompleteEvent& event);
+    void onPersonalizedTicket(const PersonalizedTicketEvent& event);
 
     ImVec4 getNotificationColor(NotificationEvent::Type type) const;
     const char* getNotificationIcon(NotificationEvent::Type type) const;
     bool renderTransferModal(const TransferProgress& transfer);
     void renderInstallModal(const InstallProgress& install);
+    void renderPersonalizedTicketModal();
 
     int currentScreen = Screen_MainMenu;
     std::vector<Notification> notifications;
     std::unordered_map<std::string, TransferProgress> activeTransfers;
     std::unordered_map<std::string, InstallProgress> activeInstalls;
+    PersonalizedTicketPrompt ticketPrompt;
     std::vector<uint64_t> eventSubscriptions;
 };
 

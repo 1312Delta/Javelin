@@ -4,7 +4,9 @@
 #include "install/stream_install.h"
 #include "install/nca_install.h"
 #include "install/cnmt.h"
+#include "install/ticket_utils.h"
 #include "mtp_log.h"
+#include <switch.h>
 #include <string.h>
 #include <strings.h>
 #include <stdlib.h>
@@ -13,8 +15,6 @@
 extern "C" {
 #include "ipcext/es.h"
 }
-
-#define STREAM_DEBUG 1
 
 #pragma pack(push, 1)
 typedef struct {
@@ -38,6 +38,7 @@ Result streamInstallInit(StreamInstallContext* ctx, InstallTarget target) {
     memset(ctx, 0, sizeof(StreamInstallContext));
     ctx->target = target;
     ctx->state = STREAM_STATE_IDLE;
+    ctx->cnmt_scanned = false;
 
     ctx->buffer = (u8*)malloc(STREAM_BUFFER_SIZE);
     if (!ctx->buffer) {
@@ -68,7 +69,7 @@ Result streamInstallInit(StreamInstallContext* ctx, InstallTarget target) {
         return rc;
     }
 
-#if STREAM_DEBUG
+#if DEBUG_INSTALL
     LOG_INFO("Stream Install: Initialized with %zu MB buffer", STREAM_BUFFER_SIZE / (1024 * 1024));
 #endif
 
@@ -132,6 +133,7 @@ void streamInstallReset(StreamInstallContext* ctx) {
     ctx->nca_offset = 0;
     ctx->ncaInstalling = false;
     ctx->cnmt_found = false;
+    ctx->cnmt_scanned = false;
     ctx->state = STREAM_STATE_IDLE;
     ctx->file_type = STREAM_TYPE_UNKNOWN;
     ctx->stream_file_offset = 0;
@@ -192,9 +194,8 @@ Result streamInstallStart(StreamInstallContext* ctx, const char* filename, u64 f
     ctx->read_pos = 0;
     ctx->total_received = 0;
 
-#if STREAM_DEBUG
-    LOG_INFO("Stream Install: Started receiving %s (%.2f MB)", filename, file_size / (1024.0 * 1024.0));
-#endif
+    LOG_INFO("Stream Install: ========== Started receiving %s (%.2f MB) ==========",
+            filename, file_size / (1024.0 * 1024.0));
 
     return 0;
 }
@@ -302,7 +303,7 @@ static bool parsePfs0Header(StreamInstallContext* ctx) {
     ctx->pfs0.header_cached = true;
     ctx->stream_file_offset = total_header_size;  // We're now at the data section
 
-#if STREAM_DEBUG
+#if DEBUG_INSTALL
     LOG_INFO("Stream Install: PFS0 header cached - %u files, data at offset 0x%lX",
              header.num_files, ctx->pfs0.data_offset);
 #endif
@@ -362,7 +363,7 @@ static Result installCurrentNca(StreamInstallContext* ctx) {
         ctx->nca_offset += read;
         total_written += read;
 
-#if STREAM_DEBUG
+#if DEBUG_INSTALL
         if ((total_written % (10 * 1024 * 1024)) == 0 || ctx->nca_offset == ctx->nca_size) {
             LOG_DEBUG("Stream Install: NCA progress: %lu / %lu bytes",
                      ctx->nca_offset, ctx->nca_size);
@@ -390,7 +391,7 @@ static Result installCurrentNca(StreamInstallContext* ctx) {
         ctx->ncaInstalling = false;
         ctx->nca_offset = 0;
 
-#if STREAM_DEBUG
+#if DEBUG_INSTALL
         LOG_INFO("Stream Install: NCA installed successfully");
 #endif
     }
@@ -405,8 +406,11 @@ static Result startNextFile(StreamInstallContext* ctx) {
     }
 
     // If we haven't started yet, find the CNMT NCA location first (we need it for metadata)
-    if (ctx->current_nca_index == 0 && !ctx->cnmt_found) {
-        // Scan all files to find the CNMT NCA
+    if (ctx->current_nca_index == 0 && !ctx->cnmt_found && !ctx->cnmt_scanned) {
+        // Scan all files to find the CNMT NCA and check ticket/cert locations
+        u64 ticket_offset = UINT64_MAX;
+        u64 cert_offset = UINT64_MAX;
+
         for (u32 i = 0; i < ctx->pfs0.num_files; i++) {
             Pfs0FileEntry entry;
             if (!getPfs0FileEntry(ctx, i, &entry)) continue;
@@ -414,13 +418,13 @@ static Result startNextFile(StreamInstallContext* ctx) {
             const char* filename = getPfs0Filename(ctx, entry.string_offset);
             if (!filename) continue;
 
-#if STREAM_DEBUG
+#if DEBUG_INSTALL
             LOG_DEBUG("Stream Install: File %u: %s (offset=0x%lX, size=%lu)", i, filename, entry.offset, entry.size);
 #endif
 
             size_t len = strlen(filename);
             if (len > 9 && strcasecmp(filename + len - 9, ".cnmt.nca") == 0) {
-                LOG_INFO("Stream Install: Found CNMT NCA: %s (index %u)", filename, i);
+                LOG_INFO("Stream Install: Found CNMT NCA: %s (index %u, offset=0x%lX)", filename, i, entry.offset);
 
                 // Parse content ID from filename
                 for (int j = 0; j < 16 && filename[j * 2] != '\0'; j++) {
@@ -429,8 +433,27 @@ static Result startNextFile(StreamInstallContext* ctx) {
                 }
                 ctx->cnmt_size = entry.size;
                 // Don't set cnmt_found yet - we'll set it after parsing
-                break;
             }
+
+            // Track ticket/cert offsets
+            if (len > 4 && strcasecmp(filename + len - 4, ".tik") == 0) {
+                ticket_offset = entry.offset;
+            }
+            if (len > 5 && strcasecmp(filename + len - 5, ".cert") == 0) {
+                cert_offset = entry.offset;
+            }
+        }
+
+        // Mark that we've scanned for CNMT
+        ctx->cnmt_scanned = true;
+
+        // Only try pre-caching if ticket/cert are within first 32MB
+        // Otherwise skip pre-caching and handle during normal sequential processing
+        u64 max_precache_offset = 32 * 1024 * 1024;  // 32MB
+
+        if (ticket_offset > max_precache_offset || cert_offset > max_precache_offset) {
+            LOG_INFO("Stream Install: Ticket/cert too far for pre-caching (ticket=0x%lX, cert=0x%lX), will cache during install",
+                    ticket_offset, cert_offset);
         }
     }
 
@@ -473,6 +496,9 @@ static Result startNextFile(StreamInstallContext* ctx) {
 
         // Handle ticket file
         if (is_ticket) {
+            LOG_INFO("Stream Install: Found ticket file: %s (size=%lu bytes, available=%lu, ticket_data=%p)",
+                    filename, entry.size, streamAvailable(ctx), ctx->ticket_data);
+
             if (streamAvailable(ctx) >= entry.size && !ctx->ticket_data) {
                 ctx->ticket_data = (u8*)malloc(entry.size);
                 if (ctx->ticket_data) {
@@ -480,13 +506,36 @@ static Result startNextFile(StreamInstallContext* ctx) {
                     if (read == entry.size) {
                         ctx->ticket_size = (u32)entry.size;
                         ctx->stream_file_offset += entry.size;
-                        LOG_INFO("Stream Install: Cached ticket: %s (%u bytes)", filename, ctx->ticket_size);
+                        LOG_INFO("Stream Install: ✓ Cached ticket: %s (%u bytes)", filename, ctx->ticket_size);
+
+                        // Check if ticket is personalized
+                        u8 rights_id[16];
+                        u64 device_id;
+                        u32 account_id;
+                        if (checkTicketMismatch(ctx->ticket_data, ctx->ticket_size,
+                                                    rights_id, &device_id, &account_id)) {
+                            ctx->ticket_is_personalized = true;
+                            ctx->waiting_for_user_response = true;
+                            LOG_INFO("Stream Install: Detected personalized ticket (Device: 0x%016lX, Account: 0x%08X)",
+                                    device_id, account_id);
+                            // Event will be posted from mtp_protocol.cpp during progress update
+                        } else {
+                            ctx->ticket_is_personalized = false;
+                            LOG_INFO("Stream Install: Ticket is common (no restrictions)");
+                        }
                     } else {
+                        LOG_ERROR("Stream Install: Failed to read ticket - expected %lu, got %lu", entry.size, read);
                         free(ctx->ticket_data);
                         ctx->ticket_data = NULL;
                     }
+                } else {
+                    LOG_ERROR("Stream Install: Failed to allocate memory for ticket (%lu bytes)", entry.size);
                 }
+            } else if (ctx->ticket_data) {
+                LOG_WARN("Stream Install: Skipping ticket %s - already have ticket cached", filename);
             } else if (streamAvailable(ctx) < entry.size) {
+                LOG_DEBUG("Stream Install: Need more data for ticket - have %lu, need %lu",
+                         streamAvailable(ctx), entry.size);
                 return 0; // Need more data
             }
             ctx->current_nca_index = i + 1;
@@ -495,6 +544,9 @@ static Result startNextFile(StreamInstallContext* ctx) {
 
         // Handle certificate file
         if (is_cert) {
+            LOG_INFO("Stream Install: Found cert file: %s (size=%lu bytes, available=%lu, cert_data=%p)",
+                    filename, entry.size, streamAvailable(ctx), ctx->cert_data);
+
             if (streamAvailable(ctx) >= entry.size && !ctx->cert_data) {
                 ctx->cert_data = (u8*)malloc(entry.size);
                 if (ctx->cert_data) {
@@ -502,13 +554,20 @@ static Result startNextFile(StreamInstallContext* ctx) {
                     if (read == entry.size) {
                         ctx->cert_size = (u32)entry.size;
                         ctx->stream_file_offset += entry.size;
-                        LOG_INFO("Stream Install: Cached cert: %s (%u bytes)", filename, ctx->cert_size);
+                        LOG_INFO("Stream Install: ✓ Cached cert: %s (%u bytes)", filename, ctx->cert_size);
                     } else {
+                        LOG_ERROR("Stream Install: Failed to read cert - expected %lu, got %lu", entry.size, read);
                         free(ctx->cert_data);
                         ctx->cert_data = NULL;
                     }
+                } else {
+                    LOG_ERROR("Stream Install: Failed to allocate memory for cert (%lu bytes)", entry.size);
                 }
+            } else if (ctx->cert_data) {
+                LOG_WARN("Stream Install: Skipping cert %s - already have cert cached", filename);
             } else if (streamAvailable(ctx) < entry.size) {
+                LOG_DEBUG("Stream Install: Need more data for cert - have %lu, need %lu",
+                         streamAvailable(ctx), entry.size);
                 return 0; // Need more data
             }
             ctx->current_nca_index = i + 1;
@@ -572,18 +631,26 @@ static Result startNextFile(StreamInstallContext* ctx) {
     return 0;
 }
 
-
 // Import cached ticket/cert if available
 static Result importCachedTicket(StreamInstallContext* ctx) {
     if (ctx->ticket_imported) {
+        LOG_INFO("Stream Install: Ticket already imported - skipping");
         return 0;  // Already imported
     }
 
+    // If waiting for user response on personalized ticket, don't proceed yet
+    if (ctx->waiting_for_user_response) {
+        LOG_DEBUG("Stream Install: Waiting for user response on personalized ticket");
+        return 0;  // Return success but don't mark as imported - will retry later
+    }
+
     if (!ctx->ticket_data || ctx->ticket_size == 0) {
-        LOG_DEBUG("Stream Install: No ticket to import (standard/free title)");
+        LOG_WARN("Stream Install: ⚠️  No ticket to import (standard/free title or ticket not cached!)");
         ctx->ticket_imported = true;  // Mark as done even if no ticket
         return 0;
     }
+
+    LOG_INFO("Stream Install: Attempting to import ticket (%u bytes)...", ctx->ticket_size);
 
     // Initialize ES service if needed
     Result rc = esInitialize();
@@ -620,16 +687,12 @@ static Result importCachedTicket(StreamInstallContext* ctx) {
 }
 
 static Result readCnmtFromInstalledNca(StreamInstallContext* ctx) {
-    // Import ticket before trying to open the CNMT NCA
-    // This is required for encrypted content
-    Result rc = importCachedTicket(ctx);
-    if (R_FAILED(rc)) {
-        LOG_WARN("Stream Install: Ticket import failed, trying anyway: 0x%08X", rc);
-        // Continue anyway - might be a free title that doesn't need a ticket
-    }
+    // Note: Ticket import is deferred to streamInstallFinalize() since the ticket
+    // may appear after the CNMT NCA in streaming mode. CNMT NCAs are typically
+    // not encrypted, so we can read them without the ticket.
 
     char cnmt_path[FS_MAX_PATH];
-    rc = ncmContentStorageGetPath(&ctx->nca_ctx->content_storage, cnmt_path,
+    Result rc = ncmContentStorageGetPath(&ctx->nca_ctx->content_storage, cnmt_path,
                                          sizeof(cnmt_path), &ctx->cnmt_id);
     if (R_FAILED(rc)) {
         LOG_ERROR("Stream Install: Failed to get CNMT path: 0x%08X", rc);
@@ -796,12 +859,23 @@ s64 streamInstallProcessData(StreamInstallContext* ctx, const void* data, u64 si
                             ctx->state = STREAM_STATE_ERROR;
                             return -1;
                         }
+                        // If startNextFile returned success but didn't start installing an NCA,
+                        // it means we're waiting for more data (e.g., ticket pre-caching)
+                        if (R_SUCCEEDED(rc) && !ctx->ncaInstalling) {
+                            break;  // Exit loop and wait for more data
+                        }
                     }
                 } else {
+                    u32 old_index = ctx->current_nca_index;
                     rc = startNextFile(ctx);
                     if (R_FAILED(rc)) {
                         ctx->state = STREAM_STATE_ERROR;
                         return -1;
+                    }
+                    // If startNextFile returned success but didn't start installing an NCA
+                    // and didn't advance the index, we're waiting for more data
+                    if (R_SUCCEEDED(rc) && !ctx->ncaInstalling && ctx->current_nca_index == old_index) {
+                        break;  // Exit loop and wait for more data
                     }
                 }
                 break;
@@ -856,6 +930,13 @@ Result streamInstallFinalize(StreamInstallContext* ctx) {
         return MAKERESULT(Module_Libnx, LibnxError_NotFound);
     }
 
+    // Import ticket now that all files have been processed and ticket is cached (if present)
+    Result rc = importCachedTicket(ctx);
+    if (R_FAILED(rc)) {
+        LOG_WARN("Stream Install: Ticket import failed: 0x%08X (may be free title)", rc);
+        // Continue anyway - might be a free title that doesn't need a ticket
+    }
+
     NcmContentInfo cnmt_info;
     cnmt_info.content_id = ctx->cnmt_id;
     ncmU64ToContentInfoSize(ctx->cnmt_size & 0xFFFFFFFFFFFFULL, &cnmt_info);
@@ -863,8 +944,8 @@ Result streamInstallFinalize(StreamInstallContext* ctx) {
 
     u8* install_meta_buffer;
     size_t install_meta_size;
-    Result rc = cnmtBuildInstallContentMeta(&ctx->cnmt_ctx, &cnmt_info, false,
-                                           &install_meta_buffer, &install_meta_size);
+    rc = cnmtBuildInstallContentMeta(&ctx->cnmt_ctx, &cnmt_info, false,
+                                     &install_meta_buffer, &install_meta_size);
     if (R_FAILED(rc)) {
         LOG_ERROR("Stream Install: Failed to build meta: 0x%08X", rc);
         return rc;
@@ -951,7 +1032,7 @@ Result streamInstallFinalize(StreamInstallContext* ctx) {
     }
 
     ctx->state = STREAM_STATE_COMPLETE;
-    LOG_INFO("Stream Install: ✓✓✓ COMPLETE! TitleID=0x%016lX", title_id);
+    LOG_INFO("Stream Install: ✓✓✓ COMPLETE! TitleID=0x%016lX, file=%s", title_id, ctx->filename);
 
     return 0;
 }
@@ -969,4 +1050,71 @@ float streamInstallGetProgress(const StreamInstallContext* ctx) {
 u64 streamInstallGetTitleId(const StreamInstallContext* ctx) {
     if (!ctx) return 0;
     return ctx->title_id;
+}
+
+const char* streamInstallGetStageString(const StreamInstallContext* ctx) {
+    if (!ctx) return "Unknown";
+
+    switch (ctx->state) {
+        case STREAM_STATE_IDLE:
+            return "Idle";
+        case STREAM_STATE_RECEIVING:
+            return "Receiving";
+        case STREAM_STATE_PARSING:
+            return "Parsing";
+        case STREAM_STATE_INSTALLING:
+            if (ctx->ticket_data && !ctx->ticket_imported) {
+                return "Installing Ticket";
+            }
+            return "Installing";
+        case STREAM_STATE_COMPLETE:
+            return "Complete";
+        case STREAM_STATE_ERROR:
+            return "Error";
+        default:
+            return "Unknown";
+    }
+}
+
+bool streamInstallIsWaitingForTicketResponse(const StreamInstallContext* ctx) {
+    if (!ctx) return false;
+    return ctx->waiting_for_user_response;
+}
+
+bool streamInstallGetTicketInfo(const StreamInstallContext* ctx, u8* out_rights_id, u64* out_device_id, u32* out_account_id) {
+    if (!ctx || !ctx->ticket_is_personalized || !ctx->ticket_data) {
+        return false;
+    }
+
+    return checkTicketMismatch(ctx->ticket_data, ctx->ticket_size,
+                                   out_rights_id, out_device_id, out_account_id) != 0;
+}
+
+void streamInstallSetTicketConversionApproved(StreamInstallContext* ctx, bool approved) {
+    if (!ctx) return;
+
+    ctx->ticket_conversion_approved = approved;
+    ctx->waiting_for_user_response = false;
+
+    if (approved && ctx->ticket_data) {
+        // Convert the ticket to common
+        convertTicketToCommon(ctx->ticket_data, ctx->ticket_size);
+        LOG_INFO("Stream Install: User approved ticket conversion");
+    } else if (!approved) {
+        // User rejected - set error state to stop installation
+        ctx->state = STREAM_STATE_ERROR;
+        ctx->last_error = MAKERESULT(Module_Libnx, LibnxError_NotFound);  // Use a meaningful error code
+        LOG_INFO("Stream Install: User rejected ticket conversion - cancelling install");
+    }
+}
+
+bool streamInstallShouldPostTicketEvent(StreamInstallContext* ctx) {
+    if (!ctx) return false;
+
+    // Only post event once
+    if (ctx->waiting_for_user_response && !ctx->ticket_event_posted) {
+        ctx->ticket_event_posted = true;
+        return true;
+    }
+    return false;
 }

@@ -13,12 +13,6 @@
 #define USB_SUBCLASS_MTP 0x01
 #define USB_PROTOCOL_MTP 0x01
 
-#if DEBUG
-#define USB_DEBUG 1
-#else
-#define USB_DEBUG 0
-#endif
-
 static bool g_initialized = false;
 static bool g_shutting_down = false;
 static UsbDsInterface* g_interface = NULL;
@@ -45,10 +39,6 @@ Result usbMtpInitialize(void) {
     if (g_initialized) {
         return MAKERESULT(Module_Libnx, LibnxError_AlreadyInitialized);
     }
-
-#if USB_DEBUG
-    DBG_PRINT("Initializing USB MTP...");
-#endif
 
     Result rc = 0;
 
@@ -288,7 +278,7 @@ Result usbMtpInitialize(void) {
     g_maxPacketSize = 512;
     g_initialized = true;
     g_shutting_down = false;
-#if USB_DEBUG
+#if DEBUG_USB
     DBG_PRINT("USB MTP initialized (buffers: %u KB)", USB_BUFFER_SIZE / 1024);
 #endif
     return 0;
@@ -302,7 +292,7 @@ cleanup:
 void usbMtpExit(void) {
     if (!g_initialized) return;
 
-#if USB_DEBUG
+#if DEBUG_USB
     DBG_PRINT("Shutting down USB MTP");
 #endif
     g_ever_ready = false;
@@ -329,7 +319,7 @@ void usbMtpExit(void) {
     if (g_initialized) {
         usbDsExit();
         g_initialized = false;
-#if USB_DEBUG
+#if DEBUG_USB
         DBG_PRINT("USB MTP shut down complete");
 #endif
     }
@@ -343,7 +333,7 @@ bool usbMtpIsReady(void) {
 
     if (ready && !g_ever_ready) {
         g_ever_ready = true;
-#if USB_DEBUG
+#if DEBUG_USB
         DBG_PRINT("Device is now ready - host configured the device");
 #endif
         if (!g_speed_detected) {
@@ -378,7 +368,7 @@ bool usbMtpIsReady(void) {
 
 size_t usbMtpRead(void* buffer, size_t size, u64 timeout_ns) {
     if (!g_initialized || g_shutting_down || !buffer || size == 0) {
-#if USB_DEBUG
+#if DEBUG_USB
         DBG_PRINT("Read: invalid params (init=%d, buf=%p, size=%zu)",
                g_initialized, buffer, size);
 #endif
@@ -419,7 +409,7 @@ size_t usbMtpRead(void* buffer, size_t size, u64 timeout_ns) {
                     eventClear(&g_epOut->CompletionEvent);
                     continue;
                 }
-#if USB_DEBUG
+#if DEBUG_USB
                 DBG_PRINT("Read: PostBufferAsync failed after retries: 0x%08X", rc);
 #endif
                 return total_transferred;
@@ -442,7 +432,7 @@ size_t usbMtpRead(void* buffer, size_t size, u64 timeout_ns) {
 
         rc = usbDsEndpoint_GetReportData(g_epOut, &reportdata);
         if (R_FAILED(rc)) {
-#if USB_DEBUG
+#if DEBUG_USB
             DBG_PRINT("Read: GetReportData failed: 0x%08X", rc);
 #endif
             return total_transferred;
@@ -460,7 +450,7 @@ size_t usbMtpRead(void* buffer, size_t size, u64 timeout_ns) {
         if (!found) {
             rc = usbDsParseReportData(&reportdata, urbId, NULL, &tmp_transferred);
             if (R_FAILED(rc)) {
-#if USB_DEBUG
+#if DEBUG_USB
                 DBG_PRINT("Read: URB %u not found (count=%u)", urbId, reportdata.report_count);
 #endif
                 if (total_transferred > 0) return total_transferred;
@@ -482,7 +472,7 @@ size_t usbMtpRead(void* buffer, size_t size, u64 timeout_ns) {
         if (tmp_transferred < chunksize) break;
     }
 
-#if USB_DEBUG
+#if DEBUG_USB
     if (total_transferred > 0) {
         DBG_PRINT("Read: %zu bytes", total_transferred);
     }
@@ -493,7 +483,7 @@ size_t usbMtpRead(void* buffer, size_t size, u64 timeout_ns) {
 
 size_t usbMtpWrite(const void* buffer, size_t size, u64 timeout_ns) {
     if (!g_initialized || g_shutting_down || !buffer || size == 0) {
-#if USB_DEBUG
+#if DEBUG_USB
         DBG_PRINT("Write: invalid params (init=%d, buf=%p, size=%zu)",
                g_initialized, buffer, size);
 #endif
@@ -506,7 +496,7 @@ size_t usbMtpWrite(const void* buffer, size_t size, u64 timeout_ns) {
 
     rc = usbDsWaitReady(timeout_ns);
     if (R_FAILED(rc)) {
-#if USB_DEBUG
+#if DEBUG_USB
         DBG_PRINT("Write: USB not ready (rc=0x%08X)", rc);
 #endif
         return 0;
@@ -538,7 +528,7 @@ size_t usbMtpWrite(const void* buffer, size_t size, u64 timeout_ns) {
                     eventClear(&g_epIn->CompletionEvent);
                     continue;
                 }
-#if USB_DEBUG
+#if DEBUG_USB
                 DBG_PRINT("Write: PostBufferAsync failed after retries: 0x%08X", rc);
 #endif
                 return total_transferred;
@@ -546,7 +536,7 @@ size_t usbMtpWrite(const void* buffer, size_t size, u64 timeout_ns) {
 
             rc = eventWait(&g_epIn->CompletionEvent, timeout_ns);
             if (R_FAILED(rc)) {
-#if USB_DEBUG
+#if DEBUG_USB
                 DBG_PRINT("Write: eventWait failed: 0x%08X", rc);
 #endif
                 usbDsEndpoint_Cancel(g_epIn);
@@ -564,7 +554,7 @@ size_t usbMtpWrite(const void* buffer, size_t size, u64 timeout_ns) {
 
         rc = usbDsEndpoint_GetReportData(g_epIn, &reportdata);
         if (R_FAILED(rc)) {
-#if USB_DEBUG
+#if DEBUG_USB
             DBG_PRINT("Write: GetReportData failed: 0x%08X", rc);
 #endif
             return total_transferred;
@@ -582,7 +572,7 @@ size_t usbMtpWrite(const void* buffer, size_t size, u64 timeout_ns) {
         if (!found) {
             rc = usbDsParseReportData(&reportdata, urbId, NULL, &tmp_transferred);
             if (R_FAILED(rc)) {
-#if USB_DEBUG
+#if DEBUG_USB
                 DBG_PRINT("Write: URB %u not found (count=%u, rc=0x%08X)",
                        urbId, reportdata.report_count, rc);
 #endif
@@ -601,7 +591,7 @@ size_t usbMtpWrite(const void* buffer, size_t size, u64 timeout_ns) {
         if (tmp_transferred < chunksize) break;
     }
 
-#if USB_DEBUG
+#if DEBUG_USB
     if (total_transferred > 0) {
         DBG_PRINT("Write: %zu bytes", total_transferred);
     }
@@ -850,7 +840,7 @@ void usbMtpResetEndpoints(void) {
         eventClear(&g_epInterrupt->CompletionEvent);
     }
 
-#if USB_DEBUG
+#if DEBUG_USB
     DBG_PRINT("Endpoints reset");
 #endif
 }

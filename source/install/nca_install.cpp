@@ -4,6 +4,9 @@
 #include "install/nca_install.h"
 #include "install/nsp_parser.h"
 #include "install/xci_parser.h"
+#include "install/ticket_utils.h"
+#include "core/TransferEvents.h"
+#include "core/Event.h"
 #include "mtp_log.h"
 #include "install/cnmt.h"
 #include <string.h>
@@ -286,6 +289,21 @@ Result ncaInstallNsp(NcaInstallContext* ctx, const char* nsp_path, u64* out_titl
             if (nspReadFile(&nsp, i, 0, tik_data, tik_size) != (s64)tik_size) {
                 free(tik_data);
                 continue;
+            }
+
+            // Check if ticket is personalized and mismatches console
+            u8 rights_id[16];
+            u64 device_id;
+            u32 account_id;
+            if (checkTicketMismatch(tik_data, (u32)tik_size, rights_id, &device_id, &account_id)) {
+                LOG_WARN("NCA Install: Personalized ticket detected with device ID mismatch!");
+                LOG_WARN("NCA Install: Ticket Device ID: 0x%016lX, Account ID: 0x%08X", device_id, account_id);
+                LOG_WARN("NCA Install: This ticket is tied to a different console.");
+                LOG_WARN("NCA Install: Converting to common ticket...");
+
+                // Auto-convert to common for regular installs
+                // TODO: Add modal prompt like MTP install
+                convertTicketToCommon(tik_data, (u32)tik_size);
             }
 
             u64 cert_size = nspGetFileSize(&nsp, cert_idx);

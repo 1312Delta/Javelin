@@ -1401,7 +1401,7 @@ static void mtpThreadFunc(void* arg) {
 }
 
 int main(int argc, char* argv[]) {
-#if DEBUG
+#if NXLINK_ENABLED
     socketInitializeDefault();
     nxlinkStdio();
     DBG_PRINT("Javelin starting in DEBUG mode");
